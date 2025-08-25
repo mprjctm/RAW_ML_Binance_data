@@ -1,8 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from prometheus_client import make_asgi_app, Counter
 
+from state import app_state
+
 # Define Prometheus metrics
-# These counters will be incremented in the main application logic
 MESSAGES_PROCESSED_COUNTER = Counter(
     "messages_processed_total",
     "Total number of messages processed, by stream type",
@@ -17,13 +18,22 @@ app = FastAPI(
 )
 
 @app.get("/health", summary="Health Check", tags=["Health"])
-async def health_check():
+async def health_check(response: Response):
     """
-    Performs a basic health check.
-    In a real application, this would check DB connections, etc.
+    Performs an intelligent health check on all application components.
+    Returns HTTP 200 if healthy.
+    Returns HTTP 503 if any component is unhealthy.
     """
-    # For now, this is a simple check. It can be expanded later.
-    return {"status": "ok"}
+    # Use a longer delay for the health check to avoid flapping during temporary issues
+    # The check in state.py uses a default of 300 seconds (5 minutes)
+    is_healthy, message = app_state.is_healthy()
+
+    if is_healthy:
+        return {"status": "ok", "details": message}
+    else:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "error", "details": message}
+
 
 # Add prometheus asgi middleware to route /metrics requests
 metrics_app = make_asgi_app()

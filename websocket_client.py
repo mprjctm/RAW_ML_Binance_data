@@ -8,10 +8,11 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 class WebsocketClient:
-    def __init__(self, url, streams, data_queue):
+    def __init__(self, url, streams, data_queue, source_name: str):
         self._url = url
         self._streams = streams
         self._data_queue = data_queue
+        self._source_name = source_name  # e.g., 'spot' or 'futures'
         self._connection = None
         self._reconnect_delay = 1  # start with 1 second
 
@@ -53,15 +54,19 @@ class WebsocketClient:
 
             try:
                 message = await self._connection.recv()
-                data = json.loads(message)
+                payload = json.loads(message)
 
-                if 'e' in data: # Most streams have an 'e' for event type
-                    await self._data_queue.put(data)
-                elif 'stream' in data: # For composite streams
-                    await self._data_queue.put(data['data'])
+                # Package the data with its source
+                data_to_queue = {
+                    "source": self._source_name,
+                    "payload": payload.get('data', payload) # Handle composite streams
+                }
+
+                if 'e' in data_to_queue['payload']: # Check for actual data messages
+                    await self._data_queue.put(data_to_queue)
                 # Handle ping/pong
-                elif 'ping' in data:
-                     await self._connection.send(json.dumps({"pong": data['ping']}))
+                elif 'ping' in payload:
+                     await self._connection.send(json.dumps({"pong": payload['ping']}))
                 elif self._connection.is_closed:
                     raise ConnectionClosed(None, None)
 

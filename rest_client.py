@@ -50,9 +50,15 @@ class RestClient:
 
             for data in results:
                 if data:
-                    data['type'] = 'openInterest'
-                    data['timestamp'] = int(datetime.utcnow().timestamp() * 1000)
-                    await self._data_queue.put(data)
+                    data_to_queue = {
+                        "source": "open_interest",
+                        "payload": {
+                            'type': 'openInterest',
+                            'timestamp': int(datetime.utcnow().timestamp() * 1000),
+                            **data
+                        }
+                    }
+                    await self._data_queue.put(data_to_queue)
 
             logger.info(f"Open interest fetch cycle complete. Waiting for {self._oi_poll_interval} seconds.")
             await asyncio.sleep(self._oi_poll_interval)
@@ -84,11 +90,14 @@ class RestClient:
                     market_type = 'spot' if i < len(self._spot_symbols) else 'futures'
 
                     snapshot_data = {
-                        'type': 'depthSnapshot',
-                        'symbol': symbol,
-                        'market_type': market_type,
-                        'timestamp': int(datetime.utcnow().timestamp() * 1000),
-                        'payload': payload
+                        'source': 'depth_snapshot',
+                        'payload': {
+                            'type': 'depthSnapshot',
+                            'symbol': symbol,
+                            'market_type': market_type,
+                            'timestamp': int(datetime.utcnow().timestamp() * 1000),
+                            'payload': payload
+                        }
                     }
                     await self._data_queue.put(snapshot_data)
 

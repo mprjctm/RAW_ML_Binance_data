@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+import time
 from asyncio import Queue
 
 import uvicorn
@@ -8,6 +9,7 @@ import uvicorn
 from config import settings
 from database import db
 from rest_client import RestClient
+from state import app_state
 from web_server import app, MESSAGES_PROCESSED_COUNTER
 from websocket_client import WebsocketClient
 
@@ -43,12 +45,27 @@ logger = logging.getLogger(__name__)
 
 
 async def data_consumer(data_queue: Queue):
-    """Consumes data from the queue and inserts it into the database."""
+    """Consumes data from the queue, updates state, and inserts into the database."""
     logger.info("Data consumer started.")
     while True:
         try:
-            data = await data_queue.get()
-            stream_type = data.get('e') or data.get('type') # 'e' for websocket, 'type' for our custom rest data
+            item = await data_queue.get()
+            source = item['source']
+            data = item['payload']
+
+            # Update state based on source
+            now = time.time()
+            if source == 'spot_ws':
+                app_state.last_spot_ws_message_time = now
+            elif source == 'futures_ws':
+                app_state.last_futures_ws_message_time = now
+            elif source == 'open_interest':
+                app_state.last_open_interest_update_time = now
+            elif source == 'depth_snapshot':
+                app_state.last_depth_snapshot_update_time = now
+
+            # Process data and insert into DB
+            stream_type = data.get('e') or data.get('type')
 
             if stream_type == 'aggTrade':
                 await db.insert_agg_trade(data)
@@ -105,21 +122,27 @@ class Service:
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
 
         # Initialize database
-        await db.init_db()
+        try:
+            await db.init_db()
+            app_state.db_connected = True
+        except Exception as e:
+            logger.critical(f"Failed to initialize database. Shutting down. Error: {e}")
+            app_state.db_connected = False
+            return # Exit the application
 
         # Create a shared queue for data
         data_queue = Queue()
 
         # --- Setup WebSocket clients ---
         spot_ws_streams = [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams]
-        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, spot_ws_streams, data_queue)
+        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, spot_ws_streams, data_queue, source_name="spot_ws")
 
         # For futures, some streams are per-symbol, others are global
         futures_ws_streams = []
         for s in settings.futures_symbols:
             futures_ws_streams.extend([f"{s}@aggTrade", f"{s}@depth@100ms"])
         futures_ws_streams.extend(["!markPrice@arr@1s", "!forceOrder@arr"])
-        futures_ws_client = WebsocketClient(settings.futures_ws_base_url, list(set(futures_ws_streams)), data_queue)
+        futures_ws_client = WebsocketClient(settings.futures_ws_base_url, list(set(futures_ws_streams)), data_queue, source_name="futures_ws")
 
         # --- Setup REST client ---
         rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
