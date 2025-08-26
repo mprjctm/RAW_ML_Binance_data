@@ -86,7 +86,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS open_interest (
                 time                TIMESTAMPTZ       NOT NULL,
                 symbol              TEXT              NOT NULL,
-                open_interest       BIGINT            NOT NULL,
+                open_interest       DECIMAL           NOT NULL,
                 payload             JSONB             NOT NULL,
                 PRIMARY KEY (symbol, time)
             );
@@ -167,7 +167,7 @@ class Database:
         """
         # Binance API for open interest returns timestamp in milliseconds
         time = datetime.fromtimestamp(data['timestamp'] / 1000.0)
-        await self._pool.execute(sql, time, data['symbol'], int(data['openInterest']), json.dumps(data))
+        await self._pool.execute(sql, time, data['symbol'], float(data['openInterest']), json.dumps(data))
 
     async def insert_depth_snapshot(self, data):
         """Inserts a depth snapshot message into the database."""

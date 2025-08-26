@@ -70,9 +70,6 @@ class WebsocketClient:
                     elif 'ping' in payload:
                         await self._connection.send(json.dumps({"pong": payload['ping']}))
 
-                if self._connection.is_closed:
-                    raise ConnectionClosed(None, None)
-
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}. Attempting to reconnect.")
                 self._connection = None
