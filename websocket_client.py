@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -14,6 +15,7 @@ class WebsocketClient:
         self._data_queue = data_queue
         self._source_name = source_name  # e.g., 'spot' or 'futures'
         self._connection = None
+        self._connection_time = None
         self._reconnect_delay = 1  # start with 1 second
 
     async def _connect(self):
@@ -31,6 +33,7 @@ class WebsocketClient:
             response = await self._connection.recv()
             logger.info(f"Subscription response: {response}")
             self._reconnect_delay = 1 # reset delay on successful connection
+            self._connection_time = time.time() # record connection time
             logger.info(f"Successfully subscribed to streams: {self._streams}")
         except (ConnectionClosed, OSError, websockets.exceptions.InvalidURI) as e:
             logger.error(f"WebSocket connection failed: {e}")
@@ -53,7 +56,17 @@ class WebsocketClient:
                     continue
 
             try:
-                message = await self._connection.recv()
+                # Proactive reconnect after 23 hours
+                if self._connection_time and (time.time() - self._connection_time > 23 * 3600):
+                    logger.info("Proactively reconnecting websocket after 23 hours.")
+                    await self._connection.close()
+                    self._connection = None
+                    self._connection_time = None
+                    continue
+
+                # Wait for a message with a timeout to allow the loop to run checks
+                message = await asyncio.wait_for(self._connection.recv(), timeout=60.0)
+
                 payload = json.loads(message)
 
                 if isinstance(payload, list):
@@ -65,11 +78,13 @@ class WebsocketClient:
                 elif isinstance(payload, dict):
                     # Handle single event
                     if 'e' in payload:  # It's a data event
-                        # The 'data' wrapper is for composite streams, which we don't use for list-based subscriptions
                         await self._data_queue.put({"source": self._source_name, "payload": payload})
                     elif 'ping' in payload:
                         await self._connection.send(json.dumps({"pong": payload['ping']}))
 
+            except asyncio.TimeoutError:
+                # Timeout is not an error, just a chance to check the connection age
+                continue
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}. Attempting to reconnect.")
                 self._connection = None
