@@ -9,7 +9,9 @@ class Settings(BaseSettings):
     For lists like symbols, use a comma-separated string in the .env file.
     Example: SPOT_SYMBOLS="btcusdt,ethusdt,bnbusdt"
     """
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore',
+                                      # This allows properties to be used
+                                      validate_assignment=True)
 
     # DATABASE
     db_dsn: str = Field("postgresql://user:password@localhost:5432/binance_data",
@@ -21,16 +23,29 @@ class Settings(BaseSettings):
     spot_api_base_url: str = "https://api.binance.com"
     futures_api_base_url: str = "https://fapi.binance.com"
 
-    # SYMBOLS - can be overridden by environment variables
-    spot_symbols: List[str] = ['btcusdt', 'ethusdt']
-    futures_symbols: List[str] = ['btcusdt', 'ethusdt']
+    # SYMBOLS - raw strings read from environment
+    # These are aliased to read SPOT_SYMBOLS and FUTURES_SYMBOLS from .env
+    spot_symbols_str: str = Field("btcusdt,ethusdt", alias='SPOT_SYMBOLS')
+    futures_symbols_str: str = Field("btcusdt,ethusdt", alias='FUTURES_SYMBOLS')
 
     # STREAMS
+    # These are not meant to be configured from .env, but are kept for logic
     spot_streams: List[str] = ['aggTrade', 'depth@100ms']
     futures_streams: List[str] = ['aggTrade', 'depth@100ms', 'markPrice@arr@1s', 'forceOrder']
 
     # REST API POLLING INTERVALS (in seconds)
     open_interest_poll_interval: int = 60
     depth_snapshot_poll_interval: int = 60
+
+    @property
+    def spot_symbols(self) -> List[str]:
+        """Returns a parsed list of spot symbols."""
+        return [s.strip() for s in self.spot_symbols_str.split(',') if s.strip()]
+
+    @property
+    def futures_symbols(self) -> List[str]:
+        """Returns a parsed list of futures symbols."""
+        return [s.strip() for s in self.futures_symbols_str.split(',') if s.strip()]
+
 
 settings = Settings()
