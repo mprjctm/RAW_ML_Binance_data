@@ -152,10 +152,19 @@ class Service:
         server = uvicorn.Server(uvicorn_config)
 
         # --- Create and schedule tasks ---
-        self.tasks.append(asyncio.create_task(spot_ws_client.run()))
-        self.tasks.append(asyncio.create_task(futures_ws_client.run()))
-        self.tasks.append(asyncio.create_task(rest_client.run_open_interest_fetcher()))
-        self.tasks.append(asyncio.create_task(rest_client.run_depth_snapshot_fetcher()))
+        if settings.enable_websocket_spot:
+            self.tasks.append(asyncio.create_task(spot_ws_client.run()))
+            logger.info("Spot WebSocket client enabled and scheduled.")
+        if settings.enable_websocket_futures:
+            self.tasks.append(asyncio.create_task(futures_ws_client.run()))
+            logger.info("Futures WebSocket client enabled and scheduled.")
+        if settings.enable_open_interest:
+            self.tasks.append(asyncio.create_task(rest_client.run_open_interest_fetcher()))
+            logger.info("Open Interest poller enabled and scheduled.")
+        if settings.enable_depth_snapshot:
+            self.tasks.append(asyncio.create_task(rest_client.run_depth_snapshot_fetcher()))
+            logger.info("Depth Snapshot poller enabled and scheduled.")
+
         self.tasks.append(asyncio.create_task(data_consumer(data_queue)))
         self.tasks.append(asyncio.create_task(server.serve()))
 

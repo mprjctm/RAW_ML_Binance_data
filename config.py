@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     open_interest_poll_interval: int = 60
     depth_snapshot_poll_interval: int = 60
 
+    # --- STREAM CONTROLS ---
+    # Set to true to enable the stream group, false to disable
+    enable_websocket_spot: bool = True
+    enable_websocket_futures: bool = True
+    enable_open_interest: bool = True
+    enable_depth_snapshot: bool = True
+
     @property
     def spot_symbols(self) -> List[str]:
         """Returns a parsed list of spot symbols."""
