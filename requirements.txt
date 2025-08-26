@@ -1,0 +1,7 @@
+websockets
+asyncpg
+fastapi
+uvicorn[standard]
+prometheus-client
+pydantic-settings
+aiohttp
