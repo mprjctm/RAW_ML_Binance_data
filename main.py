@@ -77,8 +77,11 @@ async def data_consumer(data_queue: Queue):
                 await db.insert_mark_price(data)
                 MESSAGES_PROCESSED_COUNTER.labels(stream_type='mark_price').inc()
             elif stream_type == 'forceOrder':
-                await db.insert_force_order(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='force_order').inc()
+                # Filter force orders to only include symbols from the configured list
+                symbol = data.get('o', {}).get('s')
+                if symbol and symbol.lower() in [s.lower() for s in settings.futures_symbols]:
+                    await db.insert_force_order(data)
+                    MESSAGES_PROCESSED_COUNTER.labels(stream_type='force_order_inserted').inc()
             elif stream_type == 'openInterest':
                 await db.insert_open_interest(data)
                 MESSAGES_PROCESSED_COUNTER.labels(stream_type='open_interest').inc()

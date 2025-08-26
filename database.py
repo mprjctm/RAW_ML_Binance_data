@@ -75,10 +75,12 @@ class Database:
             """
             CREATE TABLE IF NOT EXISTS force_orders (
                 event_time          TIMESTAMPTZ       NOT NULL,
+                transaction_time    TIMESTAMPTZ       NOT NULL,
                 symbol              TEXT              NOT NULL,
-                order_id            BIGINT            NOT NULL,
+                side                TEXT              NOT NULL,
+                quantity            DECIMAL           NOT NULL,
                 payload             JSONB             NOT NULL,
-                PRIMARY KEY (symbol, order_id, event_time)
+                PRIMARY KEY (symbol, event_time, transaction_time, side, quantity)
             );
             """,
             "SELECT create_hypertable('force_orders', 'event_time', if_not_exists => TRUE);",
@@ -149,19 +151,32 @@ class Database:
 
     async def insert_force_order(self, data):
         """Inserts a liquidation order message into the database."""
-        # Defensive check for malformed forceOrder payloads
-        if 'o' not in data or 'i' not in data.get('o', {}):
-            logger.warning(f"Received forceOrder message with missing 'o' or 'o.i' key. Payload: {json.dumps(data)}")
+        order_data = data['o']
+
+        # Defensive check for required keys
+        required_keys = ['s', 'S', 'q', 'T']
+        if not all(key in order_data for key in required_keys):
+            logger.warning(f"Received forceOrder message with missing keys. Payload: {json.dumps(data)}")
             return
 
         sql = """
-            INSERT INTO force_orders (event_time, symbol, order_id, payload)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (symbol, order_id, event_time) DO NOTHING;
+            INSERT INTO force_orders (event_time, transaction_time, symbol, side, quantity, payload)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (symbol, event_time, transaction_time, side, quantity) DO NOTHING;
         """
-        order_data = data['o']
+
         event_time = datetime.fromtimestamp(data['E'] / 1000.0)
-        await self._pool.execute(sql, event_time, order_data['s'], order_data['i'], json.dumps(data))
+        transaction_time = datetime.fromtimestamp(order_data['T'] / 1000.0)
+
+        await self._pool.execute(
+            sql,
+            event_time,
+            transaction_time,
+            order_data['s'],
+            order_data['S'],
+            float(order_data['q']),
+            json.dumps(data)
+        )
 
     async def insert_open_interest(self, data):
         """Inserts an open interest data point into the database."""
