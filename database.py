@@ -149,6 +149,11 @@ class Database:
 
     async def insert_force_order(self, data):
         """Inserts a liquidation order message into the database."""
+        # Defensive check for malformed forceOrder payloads
+        if 'o' not in data or 'i' not in data.get('o', {}):
+            logger.warning(f"Received forceOrder message with missing 'o' or 'o.i' key. Payload: {json.dumps(data)}")
+            return
+
         sql = """
             INSERT INTO force_orders (event_time, symbol, order_id, payload)
             VALUES ($1, $2, $3, $4)
