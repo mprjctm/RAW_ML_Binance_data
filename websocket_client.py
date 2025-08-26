@@ -56,18 +56,21 @@ class WebsocketClient:
                 message = await self._connection.recv()
                 payload = json.loads(message)
 
-                # Package the data with its source
-                data_to_queue = {
-                    "source": self._source_name,
-                    "payload": payload.get('data', payload) # Handle composite streams
-                }
+                if isinstance(payload, list):
+                    # Handle array of events (e.g., from !markPrice@arr)
+                    for item in payload:
+                        if 'e' in item:  # Ensure it's an event
+                            await self._data_queue.put({"source": self._source_name, "payload": item})
 
-                if 'e' in data_to_queue['payload']: # Check for actual data messages
-                    await self._data_queue.put(data_to_queue)
-                # Handle ping/pong
-                elif 'ping' in payload:
-                     await self._connection.send(json.dumps({"pong": payload['ping']}))
-                elif self._connection.is_closed:
+                elif isinstance(payload, dict):
+                    # Handle single event
+                    if 'e' in payload:  # It's a data event
+                        # The 'data' wrapper is for composite streams, which we don't use for list-based subscriptions
+                        await self._data_queue.put({"source": self._source_name, "payload": payload})
+                    elif 'ping' in payload:
+                        await self._connection.send(json.dumps({"pong": payload['ping']}))
+
+                if self._connection.is_closed:
                     raise ConnectionClosed(None, None)
 
             except ConnectionClosed as e:
