@@ -25,13 +25,13 @@ class Settings(BaseSettings):
 
     # SYMBOLS - raw strings read from environment
     # These are aliased to read SPOT_SYMBOLS and FUTURES_SYMBOLS from .env
-    spot_symbols_str: str = Field("btcusdt,ethusdt", alias='SPOT_SYMBOLS')
-    futures_symbols_str: str = Field("btcusdt,ethusdt", alias='FUTURES_SYMBOLS')
+    spot_symbols_str: str = Field("adausdt,maticusdt,dotusdt,avaxusdt,linkusdt,ltcusdt,atomusdt,nearusdt,ftmusdt,apeusdt", alias='SPOT_SYMBOLS')
+    futures_symbols_str: str = Field("adausdt,maticusdt,dotusdt,avaxusdt,linkusdt,ltcusdt,atomusdt,nearusdt,ftmusdt,apeusdt", alias='FUTURES_SYMBOLS')
 
     # STREAMS
     # These are not meant to be configured from .env, but are kept for logic
-    spot_streams: List[str] = ['aggTrade', 'depth@100ms']
-    futures_streams: List[str] = ['aggTrade', 'depth@100ms', 'markPrice@arr@1s', 'forceOrder']
+    spot_streams: List[str] = ['aggTrade', 'depth@500ms']
+    futures_streams: List[str] = ['aggTrade', 'depth@500ms', 'markPrice@arr@1s', 'forceOrder']
 
     # REST API POLLING INTERVALS (in seconds)
     open_interest_poll_interval: int = 60
