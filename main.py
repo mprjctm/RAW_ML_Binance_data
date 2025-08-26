@@ -101,18 +101,44 @@ class Service:
     def __init__(self):
         self.tasks = []
         self.shutdown_event = asyncio.Event()
+        self.server = None
+        self.rest_client = None
 
     async def shutdown(self, sig):
+        """Gracefully shutdown the application."""
+        if self.shutdown_event.is_set():
+            return
+
         logger.warning(f"Received exit signal {sig.name}...")
         self.shutdown_event.set()
 
-        logger.info("Cancelling all running tasks...")
-        for task in self.tasks:
+        # Gracefully shut down the Uvicorn server
+        if self.server:
+            self.server.should_exit = True
+
+        # Cancel all other application tasks
+        logger.info("Cancelling application tasks...")
+        # We create a list of tasks to cancel, excluding the Uvicorn server task
+        # and the current task (which is this shutdown handler)
+        server_task = next((t for t in self.tasks if "serve" in t.get_name()), None)
+        tasks_to_cancel = [t for t in self.tasks if t is not asyncio.current_task() and t is not server_task]
+
+        for task in tasks_to_cancel:
             task.cancel()
 
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        # Wait for tasks to finish cancelling
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
+        # Now that tasks are stopped, close connections
+        logger.info("Closing client connections...")
+        if self.rest_client:
+            await self.rest_client.close()
         await db.close()
+
+        # Wait for the server to shut down
+        if server_task:
+            await asyncio.gather(server_task, return_exceptions=True)
+
         logger.info("Application shutdown complete.")
 
     async def run(self):
@@ -148,11 +174,11 @@ class Service:
         futures_ws_client = WebsocketClient(settings.futures_ws_base_url, list(set(futures_ws_streams)), data_queue, source_name="futures_ws")
 
         # --- Setup REST client ---
-        rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
+        self.rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
 
         # --- Setup Web Server ---
         uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
-        server = uvicorn.Server(uvicorn_config)
+        self.server = uvicorn.Server(uvicorn_config)
 
         # --- Create and schedule tasks ---
         if settings.enable_websocket_spot:
@@ -162,20 +188,17 @@ class Service:
             self.tasks.append(asyncio.create_task(futures_ws_client.run()))
             logger.info("Futures WebSocket client enabled and scheduled.")
         if settings.enable_open_interest:
-            self.tasks.append(asyncio.create_task(rest_client.run_open_interest_fetcher()))
+            self.tasks.append(asyncio.create_task(self.rest_client.run_open_interest_fetcher()))
             logger.info("Open Interest poller enabled and scheduled.")
         if settings.enable_depth_snapshot:
-            self.tasks.append(asyncio.create_task(rest_client.run_depth_snapshot_fetcher()))
+            self.tasks.append(asyncio.create_task(self.rest_client.run_depth_snapshot_fetcher()))
             logger.info("Depth Snapshot poller enabled and scheduled.")
 
         self.tasks.append(asyncio.create_task(data_consumer(data_queue)))
-        self.tasks.append(asyncio.create_task(server.serve()))
+        self.tasks.append(asyncio.create_task(self.server.serve()))
 
         logger.info("All components are running.")
         await self.shutdown_event.wait()
-
-        # Clean up REST client session
-        await rest_client.close()
 
 
 if __name__ == "__main__":
