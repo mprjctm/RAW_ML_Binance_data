@@ -189,8 +189,9 @@ class Service:
 
         # Construct futures streams without using a set to preserve order
         futures_per_symbol_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']]
-        futures_global_streams = ["!markPrice@arr@1s", "!forceOrder@arr"]
-        futures_ws_streams = futures_per_symbol_streams + futures_global_streams
+        # Temporarily disable global streams to diagnose 1008 error
+        # futures_global_streams = ["!markPrice@arr@1s", "!forceOrder@arr"]
+        futures_ws_streams = futures_per_symbol_streams # + futures_global_streams
 
         futures_ws_client = WebsocketClient(settings.futures_ws_base_url, futures_ws_streams, data_queue, source_name="futures_ws")
         self.rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
