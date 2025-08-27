@@ -1,7 +1,8 @@
 import asyncpg
-import json
+import orjson as json
 import logging
 from datetime import datetime
+from typing import List, Tuple, Any
 
 from config import settings
 
@@ -16,7 +17,9 @@ class Database:
         """Creates a connection pool."""
         if not self._pool:
             try:
-                self._pool = await asyncpg.create_pool(self._dsn)
+                self._pool = await asyncpg.create_pool(self._dsn,
+                                                       # Use orjson for JSON serialization
+                                                       init=lambda c: c.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog'))
                 logger.info("Database connection pool created successfully.")
             except Exception as e:
                 logger.error(f"Could not connect to the database: {e}")
@@ -28,17 +31,12 @@ class Database:
             await self._pool.close()
             logger.info("Database connection pool closed.")
 
-    async def execute_script(self, script):
-        """Helper to execute a SQL script."""
-        async with self._pool.acquire() as conn:
-            await conn.execute(script)
-
     async def init_db(self):
         """Initializes the database, creates tables and hypertables."""
         await self.connect()
 
         # Enable the TimescaleDB extension
-        await self.execute_script("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+        await self._pool.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
 
         # Table creation scripts
         scripts = [
@@ -109,9 +107,8 @@ class Database:
         logger.info("Creating database tables and hypertables...")
         for script in scripts:
             try:
-                await self.execute_script(script)
+                await self._pool.execute(script)
             except asyncpg.exceptions.PostgresError as e:
-                # Ignore "table already exists" or "is already a hypertable" errors
                 if "already exists" in str(e) or "is already a hypertable" in str(e):
                     logger.warning(f"Warning during table creation: {e}")
                     pass
@@ -119,85 +116,64 @@ class Database:
                     raise
         logger.info("Database initialization complete.")
 
-    async def insert_agg_trade(self, data):
-        """Inserts an aggregate trade message into the database."""
-        sql = """
-            INSERT INTO agg_trades (event_time, symbol, aggregate_trade_id, payload)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (symbol, aggregate_trade_id, event_time) DO NOTHING;
-        """
-        event_time = datetime.fromtimestamp(data['E'] / 1000.0)
-        await self._pool.execute(sql, event_time, data['s'], data['a'], json.dumps(data))
+    # --- Batch Insert Methods ---
 
-    async def insert_depth_update(self, data):
-        """Inserts a depth update message into the database."""
-        sql = """
-            INSERT INTO depth_updates (event_time, symbol, first_update_id, final_update_id, payload)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (symbol, final_update_id, event_time) DO NOTHING;
-        """
-        event_time = datetime.fromtimestamp(data['E'] / 1000.0)
-        await self._pool.execute(sql, event_time, data['s'], data['U'], data['u'], json.dumps(data))
+    async def batch_insert_agg_trades(self, records: List[Tuple]):
+        sql = "INSERT INTO agg_trades (event_time, symbol, aggregate_trade_id, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
 
-    async def insert_mark_price(self, data):
-        """Inserts a mark price update message into the database."""
-        sql = """
-            INSERT INTO mark_prices (event_time, symbol, payload)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (symbol, event_time) DO NOTHING;
-        """
-        event_time = datetime.fromtimestamp(data['E'] / 1000.0)
-        await self._pool.execute(sql, event_time, data['s'], json.dumps(data))
+    async def batch_insert_depth_updates(self, records: List[Tuple]):
+        sql = "INSERT INTO depth_updates (event_time, symbol, first_update_id, final_update_id, payload) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
 
-    async def insert_force_order(self, data):
-        """Inserts a liquidation order message into the database."""
-        order_data = data['o']
+    async def batch_insert_mark_prices(self, records: List[Tuple]):
+        sql = "INSERT INTO mark_prices (event_time, symbol, payload) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
 
-        # Defensive check for required keys
+    async def batch_insert_force_orders(self, records: List[Tuple]):
+        sql = "INSERT INTO force_orders (event_time, transaction_time, symbol, side, quantity, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
+
+    async def batch_insert_open_interest(self, records: List[Tuple]):
+        sql = "INSERT INTO open_interest (time, symbol, open_interest, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
+
+    async def batch_insert_depth_snapshots(self, records: List[Tuple]):
+        sql = "INSERT INTO depth_snapshots (time, symbol, market_type, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
+        await self._pool.executemany(sql, records)
+
+    # --- Data Preparation Methods ---
+
+    def prepare_agg_trade(self, data: dict) -> Tuple:
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['a'], data)
+
+    def prepare_depth_update(self, data: dict) -> Tuple:
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['U'], data['u'], data)
+
+    def prepare_mark_price(self, data: dict) -> Tuple:
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data)
+
+    def prepare_force_order(self, data: dict) -> Tuple:
+        order_data = data.get('o', {})
         required_keys = ['s', 'S', 'q', 'T']
         if not all(key in order_data for key in required_keys):
-            logger.warning(f"Received forceOrder message with missing keys. Payload: {json.dumps(data)}")
-            return
+            logger.warning(f"Received forceOrder message with missing keys. Payload: {data}")
+            return None
 
-        sql = """
-            INSERT INTO force_orders (event_time, transaction_time, symbol, side, quantity, payload)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (symbol, event_time, transaction_time, side, quantity) DO NOTHING;
-        """
-
-        event_time = datetime.fromtimestamp(data['E'] / 1000.0)
-        transaction_time = datetime.fromtimestamp(order_data['T'] / 1000.0)
-
-        await self._pool.execute(
-            sql,
-            event_time,
-            transaction_time,
+        return (
+            datetime.fromtimestamp(data['E'] / 1000.0),
+            datetime.fromtimestamp(order_data['T'] / 1000.0),
             order_data['s'],
             order_data['S'],
             float(order_data['q']),
-            json.dumps(data)
+            data
         )
 
-    async def insert_open_interest(self, data):
-        """Inserts an open interest data point into the database."""
-        sql = """
-            INSERT INTO open_interest (time, symbol, open_interest, payload)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (symbol, time) DO NOTHING;
-        """
-        # Binance API for open interest returns timestamp in milliseconds
-        time = datetime.fromtimestamp(data['timestamp'] / 1000.0)
-        await self._pool.execute(sql, time, data['symbol'], float(data['openInterest']), json.dumps(data))
+    def prepare_open_interest(self, data: dict) -> Tuple:
+        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], float(data['openInterest']), data)
 
-    async def insert_depth_snapshot(self, data):
-        """Inserts a depth snapshot message into the database."""
-        sql = """
-            INSERT INTO depth_snapshots (time, symbol, market_type, payload)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (symbol, market_type, time) DO NOTHING;
-        """
-        time = datetime.fromtimestamp(data['timestamp'] / 1000.0)
-        await self._pool.execute(sql, time, data['symbol'], data['market_type'], json.dumps(data['payload']))
+    def prepare_depth_snapshot(self, data: dict) -> Tuple:
+        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], data['market_type'], data['payload'])
 
 
 db = Database(settings.db_dsn)

@@ -3,6 +3,7 @@ import logging
 import signal
 import time
 from asyncio import Queue
+from collections import defaultdict
 
 import uvicorn
 
@@ -13,28 +14,25 @@ from state import app_state
 from web_server import app, MESSAGES_PROCESSED_COUNTER
 from websocket_client import WebsocketClient
 
+# --- Batching Configuration ---
+BATCH_SIZE = 200
+FLUSH_INTERVAL = 1.0  # seconds
+
 # Setup logging
 def setup_logging():
     """Configures logging to file and console."""
+    # ... (rest of the function is unchanged)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-    # Root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-
-    # System log handler (all logs)
     system_handler = logging.FileHandler("system.log")
     system_handler.setLevel(logging.INFO)
     system_handler.setFormatter(formatter)
     root_logger.addHandler(system_handler)
-
-    # Error log handler (only errors)
     error_handler = logging.FileHandler("error.log")
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(formatter)
     root_logger.addHandler(error_handler)
-
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -44,56 +42,100 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
-async def data_consumer(data_queue: Queue):
-    """Consumes data from the queue, updates state, and inserts into the database."""
-    logger.info("Data consumer started.")
-    while True:
+class BatchingDataConsumer:
+    def __init__(self, data_queue: Queue):
+        self._data_queue = data_queue
+        self._batches = defaultdict(list)
+        self._last_flush_time = time.time()
+
+    async def _flush_all_batches(self):
+        """Writes all non-empty batches to the database."""
+        if not self._batches:
+            return
+
+        logger.info(f"Flushing {len(self._batches)} batches...")
+        # Create a list of tasks for each batch insertion
+        flush_tasks = []
+        if self._batches['agg_trade']:
+            flush_tasks.append(db.batch_insert_agg_trades(self._batches['agg_trade']))
+        if self._batches['depth_update']:
+            flush_tasks.append(db.batch_insert_depth_updates(self._batches['depth_update']))
+        if self._batches['mark_price']:
+            flush_tasks.append(db.batch_insert_mark_prices(self._batches['mark_price']))
+        if self._batches['force_order']:
+            flush_tasks.append(db.batch_insert_force_orders(self._batches['force_order']))
+        if self._batches['open_interest']:
+            flush_tasks.append(db.batch_insert_open_interest(self._batches['open_interest']))
+        if self._batches['depth_snapshot']:
+            flush_tasks.append(db.batch_insert_depth_snapshots(self._batches['depth_snapshot']))
+
         try:
-            item = await data_queue.get()
-            source = item['source']
-            data = item['payload']
-
-            # Update state based on source
-            now = time.time()
-            if source == 'spot_ws':
-                app_state.last_spot_ws_message_time = now
-            elif source == 'futures_ws':
-                app_state.last_futures_ws_message_time = now
-            elif source == 'open_interest':
-                app_state.last_open_interest_update_time = now
-            elif source == 'depth_snapshot':
-                app_state.last_depth_snapshot_update_time = now
-
-            # Process data and insert into DB
-            stream_type = data.get('e') or data.get('type')
-
-            if stream_type == 'aggTrade':
-                await db.insert_agg_trade(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='agg_trade').inc()
-            elif stream_type == 'depthUpdate':
-                await db.insert_depth_update(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='depth_update').inc()
-            elif stream_type == 'markPriceUpdate':
-                await db.insert_mark_price(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='mark_price').inc()
-            elif stream_type == 'forceOrder':
-                # Filter force orders to only include symbols from the configured list
-                symbol = data.get('o', {}).get('s')
-                if symbol and symbol.lower() in [s.lower() for s in settings.futures_symbols]:
-                    await db.insert_force_order(data)
-                    MESSAGES_PROCESSED_COUNTER.labels(stream_type='force_order_inserted').inc()
-            elif stream_type == 'openInterest':
-                await db.insert_open_interest(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='open_interest').inc()
-            elif stream_type == 'depthSnapshot':
-                await db.insert_depth_snapshot(data)
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type='depth_snapshot').inc()
-            else:
-                logger.warning(f"Unknown stream type received: {stream_type}")
-
-            data_queue.task_done()
+            await asyncio.gather(*flush_tasks)
+            # Clear batches after successful insertion
+            for batch_list in self._batches.values():
+                MESSAGES_PROCESSED_COUNTER.labels(stream_type=batch_list[0][0]).inc(len(batch_list))
+            self._batches.clear()
+            self._last_flush_time = time.time()
+            logger.info("All batches flushed successfully.")
         except Exception as e:
-            logger.error(f"Error processing data from queue: {e}")
+            logger.error(f"Error flushing batches to database: {e}")
+
+
+    async def periodic_flusher(self):
+        """Task that periodically flushes batches."""
+        while True:
+            await asyncio.sleep(FLUSH_INTERVAL)
+            if time.time() - self._last_flush_time > FLUSH_INTERVAL:
+                await self._flush_all_batches()
+
+    async def run(self):
+        """Consumes data, adds to batches, and flushes when full or periodically."""
+        logger.info("Data consumer with batching started.")
+        while True:
+            try:
+                item = await self._data_queue.get()
+                source = item['source']
+                data = item['payload']
+
+                now = time.time()
+                if source == 'spot_ws': app_state.last_spot_ws_message_time = now
+                elif source == 'futures_ws': app_state.last_futures_ws_message_time = now
+                elif source == 'open_interest': app_state.last_open_interest_update_time = now
+                elif source == 'depth_snapshot': app_state.last_depth_snapshot_update_time = now
+
+                stream_type = data.get('e') or data.get('type')
+                record = None
+                batch_key = None
+
+                if stream_type == 'aggTrade':
+                    record = db.prepare_agg_trade(data)
+                    batch_key = 'agg_trade'
+                elif stream_type == 'depthUpdate':
+                    record = db.prepare_depth_update(data)
+                    batch_key = 'depth_update'
+                elif stream_type == 'markPriceUpdate':
+                    record = db.prepare_mark_price(data)
+                    batch_key = 'mark_price'
+                elif stream_type == 'forceOrder':
+                    symbol = data.get('o', {}).get('s')
+                    if symbol and symbol.lower() in [s.lower() for s in settings.futures_symbols]:
+                        record = db.prepare_force_order(data)
+                        batch_key = 'force_order'
+                elif stream_type == 'openInterest':
+                    record = db.prepare_open_interest(data)
+                    batch_key = 'open_interest'
+                elif stream_type == 'depthSnapshot':
+                    record = db.prepare_depth_snapshot(data)
+                    batch_key = 'depth_snapshot'
+
+                if record and batch_key:
+                    self._batches[batch_key].append(record)
+                    if len(self._batches[batch_key]) >= BATCH_SIZE:
+                        await self._flush_all_batches()
+
+                self._data_queue.task_done()
+            except Exception as e:
+                logger.error(f"Error in data consumer loop: {e}")
 
 
 class Service:
@@ -105,96 +147,60 @@ class Service:
         self.rest_client = None
 
     async def shutdown(self, sig):
-        """Gracefully shutdown the application."""
-        if self.shutdown_event.is_set():
-            return
-
+        # ... (shutdown logic is unchanged)
+        if self.shutdown_event.is_set(): return
         logger.warning(f"Received exit signal {sig.name}...")
         self.shutdown_event.set()
-
-        # Gracefully shut down the Uvicorn server
-        if self.server:
-            self.server.should_exit = True
-
-        # Cancel all other application tasks
+        if self.server: self.server.should_exit = True
         logger.info("Cancelling application tasks...")
-        # We create a list of tasks to cancel, excluding the Uvicorn server task
-        # and the current task (which is this shutdown handler)
         server_task = next((t for t in self.tasks if "serve" in t.get_name()), None)
         tasks_to_cancel = [t for t in self.tasks if t is not asyncio.current_task() and t is not server_task]
-
-        for task in tasks_to_cancel:
-            task.cancel()
-
-        # Wait for tasks to finish cancelling
+        for task in tasks_to_cancel: task.cancel()
         await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-
-        # Now that tasks are stopped, close connections
         logger.info("Closing client connections...")
-        if self.rest_client:
-            await self.rest_client.close()
+        if self.rest_client: await self.rest_client.close()
         await db.close()
-
-        # Wait for the server to shut down
-        if server_task:
-            await asyncio.gather(server_task, return_exceptions=True)
-
+        if server_task: await asyncio.gather(server_task, return_exceptions=True)
         logger.info("Application shutdown complete.")
 
     async def run(self):
         """Main application entry point."""
         logger.info("Starting data collector application")
 
-        # Setup signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
 
-        # Initialize database
         try:
             await db.init_db()
             app_state.db_connected = True
         except Exception as e:
             logger.critical(f"Failed to initialize database. Shutting down. Error: {e}")
             app_state.db_connected = False
-            return # Exit the application
+            return
 
-        # Create a shared queue for data
         data_queue = Queue()
 
-        # --- Setup WebSocket clients ---
-        spot_ws_streams = [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams]
-        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, spot_ws_streams, data_queue, source_name="spot_ws")
-
-        # For futures, some streams are per-symbol, others are global
-        futures_ws_streams = []
-        for s in settings.futures_symbols:
-            futures_ws_streams.extend([f"{s}@aggTrade", f"{s}@depth@100ms"])
-        futures_ws_streams.extend(["!markPrice@arr@1s", "!forceOrder@arr"])
+        # --- Setup Clients and Consumer ---
+        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams], data_queue, source_name="spot_ws")
+        futures_ws_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']] + ["!markPrice@arr@1s", "!forceOrder@arr"]
         futures_ws_client = WebsocketClient(settings.futures_ws_base_url, list(set(futures_ws_streams)), data_queue, source_name="futures_ws")
-
-        # --- Setup REST client ---
         self.rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
+
+        consumer = BatchingDataConsumer(data_queue)
 
         # --- Setup Web Server ---
         uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
         self.server = uvicorn.Server(uvicorn_config)
 
         # --- Create and schedule tasks ---
-        if settings.enable_websocket_spot:
-            self.tasks.append(asyncio.create_task(spot_ws_client.run()))
-            logger.info("Spot WebSocket client enabled and scheduled.")
-        if settings.enable_websocket_futures:
-            self.tasks.append(asyncio.create_task(futures_ws_client.run()))
-            logger.info("Futures WebSocket client enabled and scheduled.")
-        if settings.enable_open_interest:
-            self.tasks.append(asyncio.create_task(self.rest_client.run_open_interest_fetcher()))
-            logger.info("Open Interest poller enabled and scheduled.")
-        if settings.enable_depth_snapshot:
-            self.tasks.append(asyncio.create_task(self.rest_client.run_depth_snapshot_fetcher()))
-            logger.info("Depth Snapshot poller enabled and scheduled.")
+        if settings.enable_websocket_spot: self.tasks.append(asyncio.create_task(spot_ws_client.run()))
+        if settings.enable_websocket_futures: self.tasks.append(asyncio.create_task(futures_ws_client.run()))
+        if settings.enable_open_interest: self.tasks.append(asyncio.create_task(self.rest_client.run_open_interest_fetcher()))
+        if settings.enable_depth_snapshot: self.tasks.append(asyncio.create_task(self.rest_client.run_depth_snapshot_fetcher()))
 
-        self.tasks.append(asyncio.create_task(data_consumer(data_queue)))
+        self.tasks.append(asyncio.create_task(consumer.run()))
+        self.tasks.append(asyncio.create_task(consumer.periodic_flusher()))
         self.tasks.append(asyncio.create_task(self.server.serve()))
 
         logger.info("All components are running.")
