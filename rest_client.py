@@ -8,23 +8,13 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 class RestClient:
-    def __init__(self, spot_symbols, futures_symbols, data_queue):
+    def __init__(self, session: aiohttp.ClientSession, spot_symbols, futures_symbols, data_queue):
+        self._session = session
         self._spot_symbols = spot_symbols
         self._futures_symbols = futures_symbols
         self._data_queue = data_queue
         self._oi_poll_interval = settings.open_interest_poll_interval
         self._depth_poll_interval = settings.depth_snapshot_poll_interval
-        self._session = None
-
-    async def _create_session(self):
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession()
-            logger.info("aiohttp client session created.")
-
-    async def _close_session(self):
-        if self._session:
-            await self._session.close()
-            logger.info("aiohttp client session closed.")
 
     async def _get(self, url, params=None):
         """Generic GET request helper."""
@@ -103,8 +93,3 @@ class RestClient:
 
             logger.info(f"Depth snapshot fetch cycle complete. Waiting for {self._depth_poll_interval} seconds.")
             await asyncio.sleep(self._depth_poll_interval)
-
-
-    async def close(self):
-        """Closes the client session."""
-        await self._close_session()

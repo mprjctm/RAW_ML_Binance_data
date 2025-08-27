@@ -2,97 +2,67 @@ import asyncio
 import orjson as json
 import logging
 import time
-import websockets
-from websockets.exceptions import ConnectionClosed
-
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 class WebsocketClient:
-    def __init__(self, url, streams, data_queue, source_name: str):
+    def __init__(self, session: aiohttp.ClientSession, url: str, streams: list, data_queue: asyncio.Queue, source_name: str):
+        self._session = session
         self._url = url
         self._streams = streams
         self._data_queue = data_queue
-        self._source_name = source_name  # e.g., 'spot' or 'futures'
-        self._connection = None
-        self._connection_time = None
-        self._reconnect_delay = 1  # start with 1 second
-
-    async def _connect(self):
-        """Connects to the WebSocket server and subscribes to streams."""
-        logger.info(f"Connecting to WebSocket server at {self._url}")
-        try:
-            self._connection = await websockets.connect(self._url)
-            subscription_payload = {
-                "method": "SUBSCRIBE",
-                "params": self._streams,
-                "id": 1
-            }
-            await self._connection.send(json.dumps(subscription_payload))
-            # The first message is the subscription confirmation
-            response = await self._connection.recv()
-            logger.info(f"Subscription response: {response}")
-            self._reconnect_delay = 1 # reset delay on successful connection
-            self._connection_time = time.time() # record connection time
-            logger.info(f"Successfully subscribed to streams: {self._streams}")
-        except (ConnectionClosed, OSError, websockets.exceptions.InvalidURI) as e:
-            logger.error(f"WebSocket connection failed: {e}")
-            self._connection = None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during connection: {e}")
-            self._connection = None
-
+        self._source_name = source_name
+        self._reconnect_delay = 1
 
     async def run(self):
         """The main loop to connect, listen, and handle reconnections."""
+        logger.info(f"[{self._source_name}] Starting WebSocket client for {self._url}")
         while True:
-            if not self._connection:
-                await self._connect()
-                if not self._connection:
-                    logger.info(f"Reconnecting in {self._reconnect_delay} seconds...")
-                    await asyncio.sleep(self._reconnect_delay)
-                    # Exponential backoff
-                    self._reconnect_delay = min(self._reconnect_delay * 2, 60)
-                    continue
-
             try:
-                # Proactive reconnect after 23 hours
-                if self._connection_time and (time.time() - self._connection_time > 23 * 3600):
-                    logger.info("Proactively reconnecting websocket after 23 hours.")
-                    await self._connection.close()
-                    self._connection = None
-                    self._connection_time = None
-                    continue
+                async with self._session.ws_connect(self._url, timeout=30) as ws:
+                    logger.info(f"[{self._source_name}] WebSocket connection established.")
+                    self._reconnect_delay = 1  # Reset reconnect delay on successful connection
 
-                # Wait for a message with a timeout to allow the loop to run checks
-                message = await asyncio.wait_for(self._connection.recv(), timeout=60.0)
+                    # Subscribe to streams
+                    subscription_payload = {
+                        "method": "SUBSCRIBE",
+                        "params": self._streams,
+                        "id": 1
+                    }
+                    await ws.send_json(subscription_payload)
+                    logger.info(f"[{self._source_name}] Subscription request sent for streams: {self._streams}")
 
-                payload = json.loads(message)
+                    # Listen for messages
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            payload = json.loads(msg.data)
 
-                if isinstance(payload, list):
-                    # Handle array of events (e.g., from !markPrice@arr)
-                    for item in payload:
-                        if 'e' in item:  # Ensure it's an event
-                            await self._data_queue.put({"source": self._source_name, "payload": item})
+                            if isinstance(payload, list):
+                                for item in payload:
+                                    if 'e' in item:
+                                        await self._data_queue.put({"source": self._source_name, "payload": item})
+                            elif isinstance(payload, dict):
+                                if 'e' in payload:
+                                    await self._data_queue.put({"source": self._source_name, "payload": payload})
+                                elif "result" in payload:
+                                     logger.info(f"[{self._source_name}] Subscription response: {payload}")
 
-                elif isinstance(payload, dict):
-                    # Handle single event
-                    if 'e' in payload:  # It's a data event
-                        await self._data_queue.put({"source": self._source_name, "payload": payload})
-                    elif 'ping' in payload:
-                        await self._connection.send(json.dumps({"pong": payload['ping']}))
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logger.error(f"[{self._source_name}] WebSocket connection closed with error: {ws.exception()}")
+                            break # Break inner loop to trigger reconnect
 
+                        elif msg.type == aiohttp.WSMsgType.CLOSED:
+                            logger.warning(f"[{self._source_name}] WebSocket connection closed by server.")
+                            break # Break inner loop to trigger reconnect
+
+            except aiohttp.ClientError as e:
+                logger.error(f"[{self._source_name}] WebSocket connection error: {e}. Attempting to reconnect.")
             except asyncio.TimeoutError:
-                # Timeout is not an error, just a chance to check the connection age
-                continue
-            except ConnectionClosed as e:
-                logger.warning(f"WebSocket connection closed: {e}. Attempting to reconnect.")
-                self._connection = None
-                await asyncio.sleep(self._reconnect_delay)
-            except json.JSONDecodeError:
-                logger.warning(f"Could not decode JSON from message: {message}")
+                logger.warning(f"[{self._source_name}] WebSocket connection timed out. Attempting to reconnect.")
             except Exception as e:
-                logger.error(f"An unexpected error occurred in the run loop: {e}")
-                self._connection = None # Reset connection to trigger reconnect
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+                logger.error(f"[{self._source_name}] An unexpected error occurred in WebSocket client: {e}")
+
+            logger.info(f"[{self._source_name}] Reconnecting in {self._reconnect_delay} seconds...")
+            await asyncio.sleep(self._reconnect_delay)
+            self._reconnect_delay = min(self._reconnect_delay * 2, 60) # Exponential backoff
