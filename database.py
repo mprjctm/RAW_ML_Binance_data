@@ -17,9 +17,7 @@ class Database:
         """Creates a connection pool."""
         if not self._pool:
             try:
-                self._pool = await asyncpg.create_pool(self._dsn,
-                                                       # Use orjson for JSON serialization
-                                                       init=lambda c: c.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads, schema='pg_catalog'))
+                self._pool = await asyncpg.create_pool(self._dsn)
                 logger.info("Database connection pool created successfully.")
             except Exception as e:
                 logger.error(f"Could not connect to the database: {e}")
@@ -145,13 +143,13 @@ class Database:
     # --- Data Preparation Methods ---
 
     def prepare_agg_trade(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['a'], data)
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['a'], json.dumps(data).decode('utf-8'))
 
     def prepare_depth_update(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['U'], data['u'], data)
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['U'], data['u'], json.dumps(data).decode('utf-8'))
 
     def prepare_mark_price(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data)
+        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], json.dumps(data).decode('utf-8'))
 
     def prepare_force_order(self, data: dict) -> Tuple:
         order_data = data.get('o', {})
@@ -166,14 +164,15 @@ class Database:
             order_data['s'],
             order_data['S'],
             float(order_data['q']),
-            data
+            json.dumps(data).decode('utf-8')
         )
 
     def prepare_open_interest(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], float(data['openInterest']), data)
+        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], float(data['openInterest']), json.dumps(data).decode('utf-8'))
 
     def prepare_depth_snapshot(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], data['market_type'], data['payload'])
+        # The 'payload' for depth snapshot is already a sub-dictionary
+        return (datetime.fromtimestamp(data['timestamp'] / 1000.0), data['symbol'], data['market_type'], json.dumps(data['payload']).decode('utf-8'))
 
 
 db = Database(settings.db_dsn)
