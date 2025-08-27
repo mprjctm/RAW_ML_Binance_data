@@ -70,13 +70,17 @@ class BatchingDataConsumer:
             flush_tasks.append(db.batch_insert_depth_snapshots(self._batches['depth_snapshot']))
 
         try:
-            await asyncio.gather(*flush_tasks)
-            # Clear batches after successful insertion
-            for batch_list in self._batches.values():
-                MESSAGES_PROCESSED_COUNTER.labels(stream_type=batch_list[0][0]).inc(len(batch_list))
-            self._batches.clear()
+            if flush_tasks:
+                await asyncio.gather(*flush_tasks)
+
+            # Update counters and clear batches that were flushed
+            for batch_key, batch_list in list(self._batches.items()):
+                if batch_list:
+                    MESSAGES_PROCESSED_COUNTER.labels(stream_type=batch_key).inc(len(batch_list))
+                    self._batches[batch_key] = [] # Clear the flushed batch
+
             self._last_flush_time = time.time()
-            logger.info("All batches flushed successfully.")
+            logger.info(f"Flushed {len(flush_tasks)} batches successfully.")
         except Exception as e:
             logger.error(f"Error flushing batches to database: {e}")
 
