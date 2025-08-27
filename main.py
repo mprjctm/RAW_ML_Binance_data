@@ -185,14 +185,11 @@ class Service:
         data_queue = Queue()
 
         # --- Setup Clients and Consumer ---
-        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams], data_queue, source_name="spot_ws")
+        # DIAGNOSTIC: Subscribe to only one stream to isolate the 1008 error
+        spot_ws_streams = ["adausdt@aggTrade"]
+        futures_ws_streams = ["adausdt@aggTrade"]
 
-        # Construct futures streams without using a set to preserve order
-        futures_per_symbol_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']]
-        # Temporarily disable global streams to diagnose 1008 error
-        # futures_global_streams = ["!markPrice@arr@1s", "!forceOrder@arr"]
-        futures_ws_streams = futures_per_symbol_streams # + futures_global_streams
-
+        spot_ws_client = WebsocketClient(settings.spot_ws_base_url, spot_ws_streams, data_queue, source_name="spot_ws")
         futures_ws_client = WebsocketClient(settings.futures_ws_base_url, futures_ws_streams, data_queue, source_name="futures_ws")
         self.rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
 
