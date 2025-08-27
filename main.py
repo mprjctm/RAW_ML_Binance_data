@@ -48,49 +48,48 @@ class BatchingDataConsumer:
         self._batches = defaultdict(list)
         self._last_flush_time = time.time()
 
-    async def _flush_all_batches(self):
+    async def _flush_all_batches(self, force=False):
         """Writes all non-empty batches to the database."""
-        if not self._batches:
-            return
-
-        logger.info(f"Flushing {len(self._batches)} batches...")
         # Create a list of tasks for each batch insertion
         flush_tasks = []
-        if self._batches['agg_trade']:
-            flush_tasks.append(db.batch_insert_agg_trades(self._batches['agg_trade']))
-        if self._batches['depth_update']:
-            flush_tasks.append(db.batch_insert_depth_updates(self._batches['depth_update']))
-        if self._batches['mark_price']:
-            flush_tasks.append(db.batch_insert_mark_prices(self._batches['mark_price']))
-        if self._batches['force_order']:
-            flush_tasks.append(db.batch_insert_force_orders(self._batches['force_order']))
-        if self._batches['open_interest']:
-            flush_tasks.append(db.batch_insert_open_interest(self._batches['open_interest']))
-        if self._batches['depth_snapshot']:
-            flush_tasks.append(db.batch_insert_depth_snapshots(self._batches['depth_snapshot']))
+        batches_to_flush = {k: v for k, v in self._batches.items() if v}
+
+        if not batches_to_flush:
+            return
+
+        logger.info(f"Flushing {len(batches_to_flush)} non-empty batches...")
+
+        if batches_to_flush.get('agg_trade'):
+            flush_tasks.append(db.batch_insert_agg_trades(batches_to_flush['agg_trade']))
+        if batches_to_flush.get('depth_update'):
+            flush_tasks.append(db.batch_insert_depth_updates(batches_to_flush['depth_update']))
+        if batches_to_flush.get('mark_price'):
+            flush_tasks.append(db.batch_insert_mark_prices(batches_to_flush['mark_price']))
+        if batches_to_flush.get('force_order'):
+            flush_tasks.append(db.batch_insert_force_orders(batches_to_flush['force_order']))
+        if batches_to_flush.get('open_interest'):
+            flush_tasks.append(db.batch_insert_open_interest(batches_to_flush['open_interest']))
+        if batches_to_flush.get('depth_snapshot'):
+            flush_tasks.append(db.batch_insert_depth_snapshots(batches_to_flush['depth_snapshot']))
 
         try:
-            if flush_tasks:
-                await asyncio.gather(*flush_tasks)
+            await asyncio.gather(*flush_tasks)
 
-            # Update counters and clear batches that were flushed
-            for batch_key, batch_list in list(self._batches.items()):
-                if batch_list:
-                    MESSAGES_PROCESSED_COUNTER.labels(stream_type=batch_key).inc(len(batch_list))
-                    self._batches[batch_key] = [] # Clear the flushed batch
+            # Update counters and clear the flushed batches
+            for batch_key, batch_list in batches_to_flush.items():
+                MESSAGES_PROCESSED_COUNTER.labels(stream_type=batch_key).inc(len(batch_list))
+                self._batches[batch_key] = []
 
             self._last_flush_time = time.time()
             logger.info(f"Flushed {len(flush_tasks)} batches successfully.")
         except Exception as e:
             logger.error(f"Error flushing batches to database: {e}")
 
-
     async def periodic_flusher(self):
         """Task that periodically flushes batches."""
         while True:
             await asyncio.sleep(FLUSH_INTERVAL)
-            if time.time() - self._last_flush_time > FLUSH_INTERVAL:
-                await self._flush_all_batches()
+            await self._flush_all_batches()
 
     async def run(self):
         """Consumes data, adds to batches, and flushes when full or periodically."""
@@ -187,8 +186,13 @@ class Service:
 
         # --- Setup Clients and Consumer ---
         spot_ws_client = WebsocketClient(settings.spot_ws_base_url, [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams], data_queue, source_name="spot_ws")
-        futures_ws_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']] + ["!markPrice@arr@1s", "!forceOrder@arr"]
-        futures_ws_client = WebsocketClient(settings.futures_ws_base_url, list(set(futures_ws_streams)), data_queue, source_name="futures_ws")
+
+        # Construct futures streams without using a set to preserve order
+        futures_per_symbol_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']]
+        futures_global_streams = ["!markPrice@arr@1s", "!forceOrder@arr"]
+        futures_ws_streams = futures_per_symbol_streams + futures_global_streams
+
+        futures_ws_client = WebsocketClient(settings.futures_ws_base_url, futures_ws_streams, data_queue, source_name="futures_ws")
         self.rest_client = RestClient(settings.spot_symbols, settings.futures_symbols, data_queue)
 
         consumer = BatchingDataConsumer(data_queue)
