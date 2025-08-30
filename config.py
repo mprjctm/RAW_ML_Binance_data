@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     enable_open_interest: bool = True
     enable_depth_snapshot: bool = True
 
+    # --- LIQUIDATION ALERTS ---
+    enable_liquidation_alerts: bool = Field(True, description="Enable or disable the liquidation alert feature.")
+    alert_max_days_lookback: int = Field(30, description="N-days lookback for fetching the historical max price.")
+    alert_percentage_drop: float = Field(10.0, description="V-percent drop from the max price to trigger an alert.")
+
     @property
     def spot_symbols(self) -> List[str]:
         """Returns a parsed list of spot symbols."""
