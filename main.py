@@ -119,23 +119,62 @@ class Service:
 
     async def shutdown(self, sig):
         if self.shutdown_event.is_set(): return
-        logger.warning(f"Received exit signal {sig.name}...")
+        logger.warning(f"Received exit signal {sig.name}... Shutting down.")
         self.shutdown_event.set()
-        if self.server: self.server.should_exit = True
-        logger.info("Cancelling application tasks...")
-        server_task = next((t for t in self.tasks if "serve" in t.get_name()), None)
-        tasks_to_cancel = [t for t in self.tasks if t is not asyncio.current_task() and t is not server_task]
-        for task in tasks_to_cancel: task.cancel()
-        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        # Stop the server from accepting new connections
+        if self.server:
+            self.server.should_exit = True
+
+        logger.info("Cancelling all application tasks...")
+        # Cancel all tasks except the current one
+        for task in self.tasks:
+            if task is not asyncio.current_task():
+                task.cancel()
+
+        # Wait for all tasks to be cancelled
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+
         logger.info("Closing client connections...")
-        if self.http_session: await self.http_session.close()
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
         await db.close()
-        if server_task: await asyncio.gather(server_task, return_exceptions=True)
+
         logger.info("Application shutdown complete.")
+
+    async def monitor_tasks(self, data_queue: Queue):
+        """Monitors all running tasks and the data queue size."""
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(60)
+
+            # Log queue size
+            logger.info(f"Data queue size: {data_queue.qsize()}")
+
+            # Check status of tasks
+            for task in self.tasks:
+                if task.done() and not task.cancelled():
+                    try:
+                        exception = task.exception()
+                        if exception:
+                            task_name = task.get_name()
+                            logger.critical(
+                                f"Task '{task_name}' has crashed with an exception: {exception}",
+                                exc_info=exception
+                            )
+                            # A critical component has failed, trigger a graceful shutdown.
+                            # We create a new task for shutdown to not block the monitor.
+                            if not self.shutdown_event.is_set():
+                                logger.critical("Initiating service shutdown due to critical task failure.")
+                                asyncio.create_task(self.shutdown(signal.SIGABRT))
+                    except asyncio.CancelledError:
+                        logger.warning(f"Task '{task.get_name()}' was cancelled.")
+                    except Exception as e:
+                        logger.error(f"Error in monitor task itself: {e}")
 
     async def run(self):
         logger.info("Starting data collector application")
         loop = asyncio.get_running_loop()
+        # Add signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
 
@@ -150,7 +189,6 @@ class Service:
 
         async with aiohttp.ClientSession() as self.http_session:
             # --- Setup Clients and Consumer ---
-            # Restore full stream lists
             spot_ws_streams = [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams]
             futures_ws_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']] + ["!markPrice@arr@1s", "!forceOrder@arr"]
 
@@ -163,15 +201,22 @@ class Service:
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
             self.server = uvicorn.Server(uvicorn_config)
 
-            # --- Create and schedule tasks ---
-            if settings.enable_websocket_spot: self.tasks.append(asyncio.create_task(spot_ws_client.run()))
-            if settings.enable_websocket_futures: self.tasks.append(asyncio.create_task(futures_ws_client.run()))
-            if settings.enable_open_interest: self.tasks.append(asyncio.create_task(rest_client.run_open_interest_fetcher()))
-            if settings.enable_depth_snapshot: self.tasks.append(asyncio.create_task(rest_client.run_depth_snapshot_fetcher()))
+            # --- Create and schedule tasks with names ---
+            task_configs = {
+                "spot_websocket_client": (spot_ws_client.run, settings.enable_websocket_spot),
+                "futures_websocket_client": (futures_ws_client.run, settings.enable_websocket_futures),
+                "open_interest_fetcher": (rest_client.run_open_interest_fetcher, settings.enable_open_interest),
+                "depth_snapshot_fetcher": (rest_client.run_depth_snapshot_fetcher, settings.enable_depth_snapshot),
+                "data_consumer": (consumer.run, True),
+                "periodic_flusher": (consumer.periodic_flusher, True),
+                "web_server": (self.server.serve, True),
+                "task_monitor": (self.monitor_tasks, True, data_queue), # Pass queue to monitor
+            }
 
-            self.tasks.append(asyncio.create_task(consumer.run()))
-            self.tasks.append(asyncio.create_task(consumer.periodic_flusher()))
-            self.tasks.append(asyncio.create_task(self.server.serve()))
+            for name, config in task_configs.items():
+                coro, enabled, *args = config
+                if enabled:
+                    self.tasks.append(asyncio.create_task(coro(*args), name=name))
 
             logger.info("All components are running.")
             await self.shutdown_event.wait()
@@ -181,5 +226,5 @@ if __name__ == "__main__":
     service = Service()
     try:
         asyncio.run(service.run())
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled.")
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Main task cancelled. Application shutting down.")
