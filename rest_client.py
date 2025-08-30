@@ -31,65 +31,69 @@ class RestClient:
 
     async def run_open_interest_fetcher(self):
         """Periodically fetches open interest for all futures symbols."""
-        await self._create_session()
         url = f"{settings.futures_api_base_url}/fapi/v1/openInterest"
         while True:
-            logger.info("Fetching open interest for all future symbols...")
-            tasks = [self._get(url, {'symbol': s.upper()}) for s in self._futures_symbols]
-            results = await asyncio.gather(*tasks)
+            try:
+                logger.info("Fetching open interest for all future symbols...")
+                tasks = [self._get(url, {'symbol': s.upper()}) for s in self._futures_symbols]
+                results = await asyncio.gather(*tasks)
 
-            for data in results:
-                if data:
-                    data_to_queue = {
-                        "source": "open_interest",
-                        "payload": {
-                            'type': 'openInterest',
-                            'timestamp': int(datetime.utcnow().timestamp() * 1000),
-                            **data
+                for data in results:
+                    if data:
+                        data_to_queue = {
+                            "source": "open_interest",
+                            "payload": {
+                                'type': 'openInterest',
+                                'timestamp': int(datetime.utcnow().timestamp() * 1000),
+                                **data
+                            }
                         }
-                    }
-                    await self._data_queue.put(data_to_queue)
+                        await self._data_queue.put(data_to_queue)
 
-            logger.info(f"Open interest fetch cycle complete. Waiting for {self._oi_poll_interval} seconds.")
+                logger.info(f"Open interest fetch cycle complete. Waiting for {self._oi_poll_interval} seconds.")
+            except Exception as e:
+                logger.error(f"An unexpected error occurred in the open interest fetcher loop: {e}", exc_info=True)
             await asyncio.sleep(self._oi_poll_interval)
 
     async def run_depth_snapshot_fetcher(self):
         """Periodically fetches depth snapshots for all symbols."""
-        await self._create_session()
         spot_url = f"{settings.spot_api_base_url}/api/v3/depth"
         futures_url = f"{settings.futures_api_base_url}/fapi/v1/depth"
 
         while True:
-            logger.info("Fetching depth snapshots for all symbols...")
-            tasks = []
-            # Spot tasks
-            for symbol in self._spot_symbols:
-                tasks.append(self._get(spot_url, {'symbol': symbol.upper(), 'limit': 1000}))
-            # Futures tasks
-            for symbol in self._futures_symbols:
-                tasks.append(self._get(futures_url, {'symbol': symbol.upper(), 'limit': 1000}))
+            try:
+                logger.info("Fetching depth snapshots for all symbols...")
+                tasks = []
+                # Spot tasks
+                for symbol in self._spot_symbols:
+                    tasks.append(self._get(spot_url, {'symbol': symbol.upper(), 'limit': 1000}))
+                # Futures tasks
+                for symbol in self._futures_symbols:
+                    tasks.append(self._get(futures_url, {'symbol': symbol.upper(), 'limit': 1000}))
 
-            results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks)
 
-            # Identify symbol and market type for each result
-            all_symbols = [s.upper() for s in self._spot_symbols] + [s.upper() for s in self._futures_symbols]
+                # Identify symbol and market type for each result
+                all_symbols = [s.upper() for s in self._spot_symbols] + [s.upper() for s in self._futures_symbols]
 
-            for i, payload in enumerate(results):
-                if payload:
-                    symbol = all_symbols[i]
-                    market_type = 'spot' if i < len(self._spot_symbols) else 'futures'
+                for i, payload in enumerate(results):
+                    if payload:
+                        symbol = all_symbols[i]
+                        market_type = 'spot' if i < len(self._spot_symbols) else 'futures'
 
-                    snapshot_data = {
-                        'source': 'depth_snapshot',
-                        'payload': {
-                            'type': 'depthSnapshot',
-                            'symbol': symbol,
-                            'market_type': market_type,
-                            'timestamp': int(datetime.utcnow().timestamp() * 1000),
-                            'payload': payload
+                        snapshot_data = {
+                            'source': 'depth_snapshot',
+                            'payload': {
+                                'type': 'depthSnapshot',
+                                'symbol': symbol,
+                                'market_type': market_type,
+                                'timestamp': int(datetime.utcnow().timestamp() * 1000),
+                                'payload': payload
+                            }
                         }
-                    }
-                    await self._data_queue.put(snapshot_data)
+                        await self._data_queue.put(snapshot_data)
 
-            logger.info(f"Depth snapshot fetch cycle complete. Waiting for {self._depth_poll_interval} seconds.")
+                logger.info(f"Depth snapshot fetch cycle complete. Waiting for {self._depth_poll_interval} seconds.")
+            except Exception as e:
+                logger.error(f"An unexpected error occurred in the depth snapshot fetcher loop: {e}", exc_info=True)
             await asyncio.sleep(self._depth_poll_interval)
