@@ -57,11 +57,11 @@ class Settings(BaseSettings):
 
     # --- LIQUIDATION ALERTS ---
     # Set to true to enable the liquidation alert feature.
-    enable_liquidation_alerts: bool = Field(True, description="Enable or disable the liquidation alert feature.")
+    enable_liquidation_alerts: bool = True
     # The number of days (N) to look back for fetching the historical max price for an alert.
-    alert_max_days_lookback: int = Field(30, description="N-days lookback for fetching the historical max price.")
+    alert_max_days_lookback: int = 30
     # The percentage (V) drop from the N-day max price that will trigger a liquidation alert.
-    alert_percentage_drop: float = Field(10.0, description="V-percent drop from the max price to trigger an alert.")
+    alert_percentage_drop: float = 10.0
 
     @property
     def spot_symbols(self) -> List[str]:
