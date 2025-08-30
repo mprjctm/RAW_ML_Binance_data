@@ -8,6 +8,7 @@ from collections import defaultdict
 import aiohttp
 import uvicorn
 
+from alerter import LiquidationAlerter
 from config import settings
 from database import db
 from rest_client import RestClient
@@ -22,32 +23,50 @@ FLUSH_INTERVAL = 1.0  # seconds
 # Setup logging
 def setup_logging():
     """Configures logging to file and console."""
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Configure root logger
+    root_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
+
+    # System handler (for general logs)
     system_handler = logging.FileHandler("system.log")
     system_handler.setLevel(logging.INFO)
-    system_handler.setFormatter(formatter)
+    system_handler.setFormatter(root_formatter)
     root_logger.addHandler(system_handler)
+
+    # Error handler
     error_handler = logging.FileHandler("error.log")
     error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(formatter)
+    error_handler.setFormatter(root_formatter)
     root_logger.addHandler(error_handler)
+
+    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(root_formatter)
     root_logger.addHandler(console_handler)
+
+    # Alerter logger (for liquidation alerts)
+    alert_formatter = logging.Formatter('%(asctime)s - %(message)s')
+    alert_logger = logging.getLogger('alerter')
+    alert_logger.setLevel(logging.INFO)
+    alert_logger.propagate = False  # Do not forward alert logs to the root logger
+
+    alert_handler = logging.FileHandler("alert.log")
+    alert_handler.setLevel(logging.INFO)
+    alert_handler.setFormatter(alert_formatter)
+    alert_logger.addHandler(alert_handler)
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 
 class BatchingDataConsumer:
-    # ... (This class is unchanged)
-    def __init__(self, data_queue: Queue):
+    def __init__(self, data_queue: Queue, alerter: LiquidationAlerter | None = None):
         self._data_queue = data_queue
         self._batches = defaultdict(list)
         self._last_flush_time = time.time()
+        self._alerter = alerter
 
     async def _flush_all_batches(self, force=False):
         flush_tasks = []
@@ -69,7 +88,6 @@ class BatchingDataConsumer:
             logger.info(f"Flushed {len(flush_tasks)} batches successfully.")
         except Exception as e:
             logger.error(f"Error flushing batches to database: {e}. Discarding failed batches to prevent memory leak.")
-            # Discard batches that failed to flush to prevent memory leak
             for batch_key in batches_to_flush:
                 if self._batches.get(batch_key) is not None:
                     self._batches[batch_key] = []
@@ -90,7 +108,17 @@ class BatchingDataConsumer:
                 elif source == 'futures_ws': app_state.last_futures_ws_message_time = now
                 elif source == 'open_interest': app_state.last_open_interest_update_time = now
                 elif source == 'depth_snapshot': app_state.last_depth_snapshot_update_time = now
+
                 stream_type = data.get('e') or data.get('type')
+
+                # --- Alerting Logic ---
+                if self._alerter and settings.enable_liquidation_alerts:
+                    if stream_type == 'markPriceUpdate':
+                        asyncio.create_task(self._alerter.update_current_price(data))
+                    elif stream_type == 'forceOrder':
+                        asyncio.create_task(self._alerter.check_liquidation(data))
+
+                # --- Batching Logic ---
                 record, batch_key = None, None
                 if stream_type == 'aggTrade': record, batch_key = db.prepare_agg_trade(data), 'agg_trade'
                 elif stream_type == 'depthUpdate': record, batch_key = db.prepare_depth_update(data), 'depth_update'
@@ -101,13 +129,15 @@ class BatchingDataConsumer:
                         record, batch_key = db.prepare_force_order(data), 'force_order'
                 elif stream_type == 'openInterest': record, batch_key = db.prepare_open_interest(data), 'open_interest'
                 elif stream_type == 'depthSnapshot': record, batch_key = db.prepare_depth_snapshot(data), 'depth_snapshot'
+
                 if record and batch_key:
                     self._batches[batch_key].append(record)
                     if len(self._batches[batch_key]) >= BATCH_SIZE:
                         await self._flush_all_batches()
+
                 self._data_queue.task_done()
             except Exception as e:
-                logger.error(f"Error in data consumer loop: {e}")
+                logger.error(f"Error in data consumer loop: {e}", exc_info=True)
 
 
 class Service:
@@ -122,17 +152,14 @@ class Service:
         logger.warning(f"Received exit signal {sig.name}... Shutting down.")
         self.shutdown_event.set()
 
-        # Stop the server from accepting new connections
         if self.server:
             self.server.should_exit = True
 
         logger.info("Cancelling all application tasks...")
-        # Cancel all tasks except the current one
         for task in self.tasks:
             if task is not asyncio.current_task():
                 task.cancel()
 
-        # Wait for all tasks to be cancelled
         await asyncio.gather(*self.tasks, return_exceptions=True)
 
         logger.info("Closing client connections...")
@@ -146,11 +173,8 @@ class Service:
         """Monitors all running tasks and the data queue size."""
         while not self.shutdown_event.is_set():
             await asyncio.sleep(60)
-
-            # Log queue size
             logger.info(f"Data queue size: {data_queue.qsize()}")
 
-            # Check status of tasks
             for task in self.tasks:
                 if task.done() and not task.cancelled():
                     try:
@@ -161,8 +185,6 @@ class Service:
                                 f"Task '{task_name}' has crashed with an exception: {exception}",
                                 exc_info=exception
                             )
-                            # A critical component has failed, trigger a graceful shutdown.
-                            # We create a new task for shutdown to not block the monitor.
                             if not self.shutdown_event.is_set():
                                 logger.critical("Initiating service shutdown due to critical task failure.")
                                 asyncio.create_task(self.shutdown(signal.SIGABRT))
@@ -174,7 +196,6 @@ class Service:
     async def run(self):
         logger.info("Starting data collector application")
         loop = asyncio.get_running_loop()
-        # Add signal handlers for graceful shutdown
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
 
@@ -187,6 +208,14 @@ class Service:
 
         data_queue = Queue()
 
+        # --- Setup Alerter ---
+        alerter = None
+        if settings.enable_liquidation_alerts:
+            logger.info("Liquidation alerts are enabled. Initializing alerter.")
+            alerter = LiquidationAlerter(db)
+        else:
+            logger.info("Liquidation alerts are disabled.")
+
         async with aiohttp.ClientSession() as self.http_session:
             # --- Setup Clients and Consumer ---
             spot_ws_streams = [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams]
@@ -195,7 +224,7 @@ class Service:
             spot_ws_client = WebsocketClient(self.http_session, settings.spot_ws_base_url, spot_ws_streams, data_queue, source_name="spot_ws")
             futures_ws_client = WebsocketClient(self.http_session, settings.futures_ws_base_url, futures_ws_streams, data_queue, source_name="futures_ws")
             rest_client = RestClient(self.http_session, settings.spot_symbols, settings.futures_symbols, data_queue)
-            consumer = BatchingDataConsumer(data_queue)
+            consumer = BatchingDataConsumer(data_queue, alerter=alerter)
 
             # --- Setup Web Server ---
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
@@ -210,8 +239,12 @@ class Service:
                 "data_consumer": (consumer.run, True),
                 "periodic_flusher": (consumer.periodic_flusher, True),
                 "web_server": (self.server.serve, True),
-                "task_monitor": (self.monitor_tasks, True, data_queue), # Pass queue to monitor
+                "task_monitor": (self.monitor_tasks, True, data_queue),
             }
+
+            # Add alerter task if enabled
+            if alerter and settings.enable_liquidation_alerts:
+                task_configs["alerter_price_updater"] = (alerter.update_historical_max_prices, True)
 
             for name, config in task_configs.items():
                 coro, enabled, *args = config
