@@ -68,7 +68,11 @@ class BatchingDataConsumer:
             self._last_flush_time = time.time()
             logger.info(f"Flushed {len(flush_tasks)} batches successfully.")
         except Exception as e:
-            logger.error(f"Error flushing batches to database: {e}")
+            logger.error(f"Error flushing batches to database: {e}. Discarding failed batches to prevent memory leak.")
+            # Discard batches that failed to flush to prevent memory leak
+            for batch_key in batches_to_flush:
+                if self._batches.get(batch_key) is not None:
+                    self._batches[batch_key] = []
 
     async def periodic_flusher(self):
         while True:
