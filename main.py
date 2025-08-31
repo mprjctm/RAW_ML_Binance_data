@@ -244,7 +244,7 @@ class Service:
 
             # Add alerter task if enabled
             if alerter and settings.enable_liquidation_alerts:
-                task_configs["alerter_price_updater"] = (alerter.update_historical_max_prices, True)
+                task_configs["alerter_price_updater"] = (alerter.update_historical_extremum_prices, True)
 
             for name, config in task_configs.items():
                 coro, enabled, *args = config
