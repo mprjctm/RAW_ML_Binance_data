@@ -153,14 +153,15 @@ class Database:
         Returns:
             The maximum price as a float, or None if no data is found.
         """
-        sql = """
+        # Note: We use an f-string for the interval, which is safe here because 'days' is a controlled integer.
+        # This is more direct than creating a separate interval string that asyncpg might misinterpret.
+        sql = f"""
             SELECT MAX((payload->>'p')::numeric)
             FROM mark_prices
-            WHERE symbol = $1 AND event_time >= NOW() - $2::interval
+            WHERE symbol = $1 AND event_time >= NOW() - INTERVAL '{days} days'
         """
-        interval = f"{days} days"
         try:
-            max_price = await self._pool.fetchval(sql, symbol.upper(), interval)
+            max_price = await self._pool.fetchval(sql, symbol.upper())
             return float(max_price) if max_price is not None else None
         except Exception as e:
             logger.error(f"Error fetching max price for {symbol}: {e}")
@@ -177,14 +178,13 @@ class Database:
         Returns:
             The minimum price as a float, or None if no data is found.
         """
-        sql = """
+        sql = f"""
             SELECT MIN((payload->>'p')::numeric)
             FROM mark_prices
-            WHERE symbol = $1 AND event_time >= NOW() - $2::interval
+            WHERE symbol = $1 AND event_time >= NOW() - INTERVAL '{days} days'
         """
-        interval = f"{days} days"
         try:
-            min_price = await self._pool.fetchval(sql, symbol.upper(), interval)
+            min_price = await self._pool.fetchval(sql, symbol.upper())
             return float(min_price) if min_price is not None else None
         except Exception as e:
             logger.error(f"Error fetching min price for {symbol}: {e}")
