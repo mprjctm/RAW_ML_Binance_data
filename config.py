@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # REST API POLLING INTERVALS (in seconds)
     open_interest_poll_interval: int = 60
     depth_snapshot_poll_interval: int = 60
+    depth_snapshot_request_delay: int = Field(5, description="Delay between individual depth snapshot requests in seconds.")
 
     @property
     def spot_symbols(self) -> List[str]:
