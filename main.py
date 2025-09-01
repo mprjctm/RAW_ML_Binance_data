@@ -19,6 +19,7 @@ from websocket_client import WebsocketClient
 # --- Batching Configuration ---
 BATCH_SIZE = 200
 FLUSH_INTERVAL = 1.0  # seconds
+WS_STREAM_CHUNK_SIZE = 200  # Max streams per WebSocket connection
 
 # Setup logging
 def setup_logging():
@@ -216,13 +217,31 @@ class Service:
         else:
             logger.info("Liquidation alerts are disabled.")
 
+        def chunk_list(lst, n):
+            """Yield successive n-sized chunks from lst."""
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
         async with aiohttp.ClientSession() as self.http_session:
             # --- Setup Clients and Consumer ---
             spot_ws_streams = [f"{s}@{st}" for s in settings.spot_symbols for st in settings.spot_streams]
-            futures_ws_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']] + ["!markPrice@arr@1s", "!forceOrder@arr"]
 
-            spot_ws_client = WebsocketClient(self.http_session, settings.spot_ws_base_url, spot_ws_streams, data_queue, source_name="spot_ws")
-            futures_ws_client = WebsocketClient(self.http_session, settings.futures_ws_base_url, futures_ws_streams, data_queue, source_name="futures_ws")
+            # Separate symbol-specific streams from general streams for futures
+            futures_symbol_streams = [f"{s}@{st}" for s in settings.futures_symbols for st in ['aggTrade', 'depth@500ms']]
+            futures_general_streams = ["!markPrice@arr@1s", "!forceOrder@arr"]
+
+            # Chunk streams to respect connection limits
+            spot_stream_chunks = list(chunk_list(spot_ws_streams, WS_STREAM_CHUNK_SIZE))
+            futures_stream_chunks = list(chunk_list(futures_symbol_streams, WS_STREAM_CHUNK_SIZE))
+            # Add general streams to the first chunk if possible, or a new chunk if needed
+            if futures_stream_chunks:
+                if len(futures_stream_chunks[0]) + len(futures_general_streams) <= WS_STREAM_CHUNK_SIZE:
+                    futures_stream_chunks[0].extend(futures_general_streams)
+                else:
+                    futures_stream_chunks.append(futures_general_streams)
+            elif futures_general_streams:
+                 futures_stream_chunks.append(futures_general_streams)
+
             rest_client = RestClient(self.http_session, settings.spot_symbols, settings.futures_symbols, data_queue)
             consumer = BatchingDataConsumer(data_queue, alerter=alerter)
 
@@ -232,8 +251,6 @@ class Service:
 
             # --- Create and schedule tasks with names ---
             task_configs = {
-                "spot_websocket_client": (spot_ws_client.run, settings.enable_websocket_spot),
-                "futures_websocket_client": (futures_ws_client.run, settings.enable_websocket_futures),
                 "open_interest_fetcher": (rest_client.run_open_interest_fetcher, settings.enable_open_interest),
                 "depth_snapshot_fetcher": (rest_client.run_depth_snapshot_fetcher, settings.enable_depth_snapshot),
                 "data_consumer": (consumer.run, True),
@@ -241,6 +258,16 @@ class Service:
                 "web_server": (self.server.serve, True),
                 "task_monitor": (self.monitor_tasks, True, data_queue),
             }
+
+            # Create websocket client tasks for each chunk
+            for i, chunk in enumerate(spot_stream_chunks):
+                client = WebsocketClient(self.http_session, settings.spot_ws_base_url, chunk, data_queue, source_name=f"spot_ws_{i+1}")
+                task_configs[f"spot_websocket_client_{i+1}"] = (client.run, settings.enable_websocket_spot)
+
+            for i, chunk in enumerate(futures_stream_chunks):
+                client = WebsocketClient(self.http_session, settings.futures_ws_base_url, chunk, data_queue, source_name=f"futures_ws_{i+1}")
+                task_configs[f"futures_websocket_client_{i+1}"] = (client.run, settings.enable_websocket_futures)
+
 
             # Add alerter task if enabled
             if alerter and settings.enable_liquidation_alerts:
@@ -251,7 +278,7 @@ class Service:
                 if enabled:
                     self.tasks.append(asyncio.create_task(coro(*args), name=name))
 
-            logger.info("All components are running.")
+            logger.info(f"All components are running. Spot clients: {len(spot_stream_chunks)}, Futures clients: {len(futures_stream_chunks)}")
             await self.shutdown_event.wait()
 
 
