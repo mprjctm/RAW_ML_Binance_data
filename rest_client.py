@@ -59,41 +59,46 @@ class RestClient:
         """Periodically fetches depth snapshots for all symbols."""
         spot_url = f"{settings.spot_api_base_url}/api/v3/depth"
         futures_url = f"{settings.futures_api_base_url}/fapi/v1/depth"
+        all_symbols = [(s, 'spot') for s in self._spot_symbols] + [(s, 'futures') for s in self._futures_symbols]
 
         while True:
             try:
-                logger.info("Fetching depth snapshots for all symbols...")
-                tasks = []
-                # Spot tasks
-                for symbol in self._spot_symbols:
-                    tasks.append(self._get(spot_url, {'symbol': symbol.upper(), 'limit': 1000}))
-                # Futures tasks
-                for symbol in self._futures_symbols:
-                    tasks.append(self._get(futures_url, {'symbol': symbol.upper(), 'limit': 1000}))
+                logger.info("Starting depth snapshot fetch cycle for all symbols...")
 
-                results = await asyncio.gather(*tasks)
+                for symbol, market_type in all_symbols:
+                    try:
+                        url = spot_url if market_type == 'spot' else futures_url
+                        params = {'symbol': symbol.upper(), 'limit': 1000}
 
-                # Identify symbol and market type for each result
-                all_symbols = [s.upper() for s in self._spot_symbols] + [s.upper() for s in self._futures_symbols]
+                        logger.info(f"Fetching depth for {symbol} ({market_type})...")
+                        payload = await self._get(url, params)
 
-                for i, payload in enumerate(results):
-                    if payload:
-                        symbol = all_symbols[i]
-                        market_type = 'spot' if i < len(self._spot_symbols) else 'futures'
-
-                        snapshot_data = {
-                            'source': 'depth_snapshot',
-                            'payload': {
-                                'type': 'depthSnapshot',
-                                'symbol': symbol,
-                                'market_type': market_type,
-                                'timestamp': int(datetime.utcnow().timestamp() * 1000),
-                                'payload': payload
+                        if payload:
+                            snapshot_data = {
+                                'source': 'depth_snapshot',
+                                'payload': {
+                                    'type': 'depthSnapshot',
+                                    'symbol': symbol.upper(),
+                                    'market_type': market_type,
+                                    'timestamp': int(datetime.utcnow().timestamp() * 1000),
+                                    'payload': payload
+                                }
                             }
-                        }
-                        await self._data_queue.put(snapshot_data)
+                            await self._data_queue.put(snapshot_data)
+                            logger.info(f"Successfully queued depth for {symbol}.")
+                        else:
+                            logger.warning(f"Did not receive payload for {symbol}.")
 
-                logger.info(f"Depth snapshot fetch cycle complete. Waiting for {self._depth_poll_interval} seconds.")
+                        # Wait for 5 seconds before fetching the next symbol
+                        await asyncio.sleep(5)
+
+                    except Exception as e:
+                        logger.error(f"Error fetching depth for symbol {symbol}: {e}", exc_info=True)
+                        # Optional: decide if you want to sleep even after an error
+                        await asyncio.sleep(5)
+
+                logger.info("Depth snapshot fetch cycle complete. Starting new cycle immediately.")
             except Exception as e:
                 logger.error(f"An unexpected error occurred in the depth snapshot fetcher loop: {e}", exc_info=True)
-            await asyncio.sleep(self._depth_poll_interval)
+                # If a major error occurs in the loop, wait before retrying to prevent a fast failure loop.
+                await asyncio.sleep(30)
