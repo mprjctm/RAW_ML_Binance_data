@@ -179,5 +179,46 @@ class Database:
         time = datetime.fromtimestamp(data['timestamp'] / 1000.0)
         await self._pool.execute(sql, time, data['symbol'], data['market_type'], json.dumps(data['payload']))
 
+    # --- Data Query Methods ---
+
+    async def get_recent_liquidations(self, symbol: str, limit: int = 10):
+        """Fetches the most recent liquidation orders for a given symbol."""
+        sql = """
+            SELECT payload
+            FROM force_orders
+            WHERE symbol = $1
+            ORDER BY event_time DESC
+            LIMIT $2;
+        """
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(sql, symbol, limit)
+            return [json.loads(record['payload']) for record in records]
+
+    async def get_latest_orderbook_snapshot(self, symbol: str):
+        """Fetches the latest order book snapshot for a given futures symbol."""
+        sql = """
+            SELECT payload
+            FROM depth_snapshots
+            WHERE symbol = $1 AND market_type = 'futures'
+            ORDER BY time DESC
+            LIMIT 1;
+        """
+        async with self._pool.acquire() as conn:
+            record = await conn.fetchrow(sql, symbol)
+            return json.loads(record['payload']) if record else None
+
+    async def get_latest_agg_trades(self, symbol: str, limit: int = 10):
+        """Fetches the most recent aggregate trades for a given symbol."""
+        sql = """
+            SELECT payload
+            FROM agg_trades
+            WHERE symbol = $1
+            ORDER BY event_time DESC
+            LIMIT $2;
+        """
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(sql, symbol, limit)
+            return [json.loads(record['payload']) for record in records]
+
 
 db = Database(settings.db_dsn)
