@@ -1,9 +1,8 @@
 from typing import List
+import logging
 from fastapi import FastAPI, Response, status, APIRouter, HTTPException, Query
-
 from prometheus_client import make_asgi_app, Counter
 
-import logging
 from state import app_state
 from database import db
 from api_models import LiquidationEvent, OrderBook, Trade, OrderRequest, OrderResponse
@@ -21,6 +20,9 @@ app = FastAPI(
     description="A service to collect and store market data from Binance.",
     version="0.1.0"
 )
+
+# Get a logger instance
+logger = logging.getLogger(__name__)
 
 @app.get("/health", summary="Health Check", tags=["Health"])
 async def health_check(response: Response):
@@ -94,9 +96,6 @@ async def get_trades(
     # The payload in db is the direct aggTrade message. Let's parse it for our Trade model.
     # The model uses aliases, so we can pass the dicts directly.
     return raw_data
-
-# Get a logger instance
-logger = logging.getLogger(__name__)
 
 @router_v1.post("/orders", response_model=OrderResponse)
 async def create_order(order: OrderRequest):
