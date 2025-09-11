@@ -8,7 +8,6 @@ from collections import defaultdict
 import aiohttp
 import uvicorn
 
-from alerter import LiquidationAlerter
 from config import settings
 from database import db
 from rest_client import RestClient
@@ -47,27 +46,15 @@ def setup_logging():
     console_handler.setFormatter(root_formatter)
     root_logger.addHandler(console_handler)
 
-    # Alerter logger (for liquidation alerts)
-    alert_formatter = logging.Formatter('%(asctime)s - %(message)s')
-    alert_logger = logging.getLogger('alerter')
-    alert_logger.setLevel(logging.INFO)
-    alert_logger.propagate = False  # Do not forward alert logs to the root logger
-
-    alert_handler = logging.FileHandler("alert.log")
-    alert_handler.setLevel(logging.INFO)
-    alert_handler.setFormatter(alert_formatter)
-    alert_logger.addHandler(alert_handler)
-
 setup_logging()
 logger = logging.getLogger(__name__)
 
 
 class BatchingDataConsumer:
-    def __init__(self, data_queue: Queue, alerter: LiquidationAlerter | None = None):
+    def __init__(self, data_queue: Queue):
         self._data_queue = data_queue
         self._batches = defaultdict(list)
         self._last_flush_time = time.time()
-        self._alerter = alerter
 
     async def _flush_all_batches(self, force=False):
         flush_tasks = []
@@ -111,13 +98,6 @@ class BatchingDataConsumer:
                 elif source == 'depth_snapshot': app_state.last_depth_snapshot_update_time = now
 
                 stream_type = data.get('e') or data.get('type')
-
-                # --- Alerting Logic ---
-                if self._alerter and settings.enable_liquidation_alerts:
-                    if stream_type == 'markPriceUpdate':
-                        asyncio.create_task(self._alerter.update_current_price(data))
-                    elif stream_type == 'forceOrder':
-                        asyncio.create_task(self._alerter.check_liquidation(data))
 
                 # --- Batching Logic ---
                 record, batch_key = None, None
@@ -209,14 +189,6 @@ class Service:
 
         data_queue = Queue()
 
-        # --- Setup Alerter ---
-        alerter = None
-        if settings.enable_liquidation_alerts:
-            logger.info("Liquidation alerts are enabled. Initializing alerter.")
-            alerter = LiquidationAlerter(db)
-        else:
-            logger.info("Liquidation alerts are disabled.")
-
         def chunk_list(lst, n):
             """Yield successive n-sized chunks from lst."""
             for i in range(0, len(lst), n):
@@ -243,7 +215,7 @@ class Service:
                  futures_stream_chunks.append(futures_general_streams)
 
             rest_client = RestClient(self.http_session, settings.spot_symbols, settings.futures_symbols, data_queue)
-            consumer = BatchingDataConsumer(data_queue, alerter=alerter)
+            consumer = BatchingDataConsumer(data_queue)
 
             # --- Setup Web Server ---
             uvicorn_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
@@ -267,11 +239,6 @@ class Service:
             for i, chunk in enumerate(futures_stream_chunks):
                 client = WebsocketClient(self.http_session, settings.futures_ws_base_url, chunk, data_queue, source_name=f"futures_ws_{i+1}")
                 task_configs[f"futures_websocket_client_{i+1}"] = (client.run, settings.enable_websocket_futures)
-
-
-            # Add alerter task if enabled
-            if alerter and settings.enable_liquidation_alerts:
-                task_configs["alerter_price_updater"] = (alerter.update_historical_extremum_prices, True)
 
             for name, config in task_configs.items():
                 coro, enabled, *args = config

@@ -55,14 +55,6 @@ class Settings(BaseSettings):
     # Set to true to enable polling for Depth Snapshots.
     enable_depth_snapshot: bool = True
 
-    # --- LIQUIDATION ALERTS ---
-    # Set to true to enable the liquidation alert feature.
-    enable_liquidation_alerts: bool = True
-    # The number of days (N) to look back for fetching the historical min/max prices.
-    alert_max_days_lookback: int = 30
-    # The percentage (X) deviation from an N-day extremum (min or max) to trigger an alert.
-    alert_extremum_deviation_percent: float = 5.0
-
     @property
     def spot_symbols(self) -> List[str]:
         """Returns a parsed list of spot symbols."""
