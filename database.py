@@ -140,56 +140,6 @@ class Database:
         sql = "INSERT INTO depth_snapshots (time, symbol, market_type, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
         await self._pool.executemany(sql, records)
 
-    # --- Query Methods ---
-
-    async def get_max_price_in_period(self, symbol: str, days: int) -> float | None:
-        """
-        Fetches the maximum mark price for a given symbol over a specified lookback period.
-
-        Args:
-            symbol: The symbol to query (e.g., 'BTCUSDT').
-            days: The number of days to look back.
-
-        Returns:
-            The maximum price as a float, or None if no data is found.
-        """
-        # Note: We use an f-string for the interval, which is safe here because 'days' is a controlled integer.
-        # This is more direct than creating a separate interval string that asyncpg might misinterpret.
-        sql = f"""
-            SELECT MAX((payload->>'p')::numeric)
-            FROM mark_prices
-            WHERE symbol = $1 AND event_time >= NOW() - INTERVAL '{days} days'
-        """
-        try:
-            max_price = await self._pool.fetchval(sql, symbol.upper())
-            return float(max_price) if max_price is not None else None
-        except Exception as e:
-            logger.error(f"Error fetching max price for {symbol}: {e}")
-            return None
-
-    async def get_min_price_in_period(self, symbol: str, days: int) -> float | None:
-        """
-        Fetches the minimum mark price for a given symbol over a specified lookback period.
-
-        Args:
-            symbol: The symbol to query (e.g., 'BTCUSDT').
-            days: The number of days to look back.
-
-        Returns:
-            The minimum price as a float, or None if no data is found.
-        """
-        sql = f"""
-            SELECT MIN((payload->>'p')::numeric)
-            FROM mark_prices
-            WHERE symbol = $1 AND event_time >= NOW() - INTERVAL '{days} days'
-        """
-        try:
-            min_price = await self._pool.fetchval(sql, symbol.upper())
-            return float(min_price) if min_price is not None else None
-        except Exception as e:
-            logger.error(f"Error fetching min price for {symbol}: {e}")
-            return None
-
     # --- Data Preparation Methods ---
 
     def prepare_agg_trade(self, data: dict) -> Tuple:
