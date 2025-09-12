@@ -36,6 +36,20 @@ class Database:
         # Enable the TimescaleDB extension
         await self._pool.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
 
+        # --- Schema Migrations ---
+        # Run simple migrations to ensure columns exist for backward compatibility.
+        # This is idempotent and safe to run on every startup.
+        logger.info("Applying database migrations...")
+        try:
+            await self._pool.execute("ALTER TABLE agg_trades ADD COLUMN IF NOT EXISTS price DECIMAL;")
+            await self._pool.execute("ALTER TABLE agg_trades ADD COLUMN IF NOT EXISTS quantity DECIMAL;")
+            logger.info("Migrations for agg_trades table applied successfully.")
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("Migration skipped: agg_trades table does not exist yet. It will be created.")
+        except Exception as e:
+            logger.error(f"Error applying migrations: {e}")
+            raise
+
         # Table creation scripts
         scripts = [
             """
