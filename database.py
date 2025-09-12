@@ -43,6 +43,8 @@ class Database:
                 event_time          TIMESTAMPTZ       NOT NULL,
                 symbol              TEXT              NOT NULL,
                 aggregate_trade_id  BIGINT            NOT NULL,
+                price               DECIMAL           NOT NULL,
+                quantity            DECIMAL           NOT NULL,
                 payload             JSONB             NOT NULL,
                 PRIMARY KEY (symbol, aggregate_trade_id, event_time)
             );
@@ -117,7 +119,7 @@ class Database:
     # --- Batch Insert Methods ---
 
     async def batch_insert_agg_trades(self, records: List[Tuple]):
-        sql = "INSERT INTO agg_trades (event_time, symbol, aggregate_trade_id, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
+        sql = "INSERT INTO agg_trades (event_time, symbol, aggregate_trade_id, price, quantity, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING"
         await self._pool.executemany(sql, records)
 
     async def batch_insert_depth_updates(self, records: List[Tuple]):
@@ -143,7 +145,14 @@ class Database:
     # --- Data Preparation Methods ---
 
     def prepare_agg_trade(self, data: dict) -> Tuple:
-        return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['a'], json.dumps(data).decode('utf-8'))
+        return (
+            datetime.fromtimestamp(data['E'] / 1000.0),
+            data['s'],
+            data['a'],
+            float(data['p']),
+            float(data['q']),
+            json.dumps(data).decode('utf-8')
+        )
 
     def prepare_depth_update(self, data: dict) -> Tuple:
         return (datetime.fromtimestamp(data['E'] / 1000.0), data['s'], data['U'], data['u'], json.dumps(data).decode('utf-8'))
