@@ -16,8 +16,8 @@ from web_server import app, MESSAGES_PROCESSED_COUNTER
 from websocket_client import WebsocketClient
 
 # --- Batching Configuration ---
-BATCH_SIZE = 200
-FLUSH_INTERVAL = 1.0  # seconds
+BATCH_SIZE = 1000
+FLUSH_INTERVAL = 5.0  # seconds
 WS_STREAM_CHUNK_SIZE = 200  # Max streams per WebSocket connection
 
 # Setup logging
