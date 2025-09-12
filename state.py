@@ -1,6 +1,8 @@
 import time
 from dataclasses import dataclass, field
 
+from config import settings
+
 @dataclass
 class AppState:
     """A simple dataclass to hold the shared state of the application."""
@@ -20,18 +22,23 @@ class AppState:
         if not self.db_connected:
             return False, "Database is not connected."
 
-        if (now - self.last_spot_ws_message_time) > max_delay_seconds:
-            return False, "Spot WebSocket seems stale."
+        # --- Check component health only if they are enabled ---
+        if settings.enable_websocket_spot:
+            if (now - self.last_spot_ws_message_time) > max_delay_seconds:
+                return False, "Spot WebSocket seems stale."
 
-        if (now - self.last_futures_ws_message_time) > max_delay_seconds:
-            return False, "Futures WebSocket seems stale."
+        if settings.enable_websocket_futures:
+            if (now - self.last_futures_ws_message_time) > max_delay_seconds:
+                return False, "Futures WebSocket seems stale."
 
-        if (now - self.last_open_interest_update_time) > max_delay_seconds:
-            return False, "Open Interest poller seems stale."
+        if settings.enable_open_interest:
+            if (now - self.last_open_interest_update_time) > max_delay_seconds:
+                return False, "Open Interest poller seems stale."
 
         # Depth snapshot interval is 1 min, so we give it a bit more buffer
-        if (now - self.last_depth_snapshot_update_time) > (max_delay_seconds + 60):
-             return False, "Depth Snapshot poller seems stale."
+        if settings.enable_depth_snapshot:
+            if (now - self.last_depth_snapshot_update_time) > (max_delay_seconds + 60):
+                 return False, "Depth Snapshot poller seems stale."
 
         return True, "All components are healthy."
 
