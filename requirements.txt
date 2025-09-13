@@ -6,3 +6,8 @@ prometheus-client
 pydantic-settings
 aiohttp
 orjson
+pytest
+pandas
+numpy
+pyarrow
+psycopg2-binary
