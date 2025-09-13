@@ -34,7 +34,10 @@ from backtester.feature_extraction.features import (
     calculate_absorption_strength,
     calculate_cascade_exhaustion,
     calculate_panic_index,
-    calculate_order_flow_delta
+    calculate_order_flow_delta,
+    calculate_orderbook_imbalance,
+    calculate_liquidity_walls,
+    calculate_footprint_imbalance
 )
 
 # --- Конфигурация ---
@@ -74,17 +77,38 @@ def load_trades_data(engine, symbol: str, start_date: str, end_date: str) -> pd.
     return df
 
 def load_depth_data(engine, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Загружает данные о стакане (depth_updates). В этой реализации не используется."""
+    """
+    Загружает данные о состоянии стакана (depth_updates) из БД.
+    Извлекает списки заявок на покупку (bids) и продажу (asks).
+    """
     print(f"Loading depth data for {symbol}...")
+    # SQL-запрос для извлечения данных стакана.
+    # `payload->'b'` и `payload->'a'` - синтаксис PostgreSQL для доступа к ключам JSON.
     query = text("""
-        SELECT event_time, payload FROM depth_updates
+        SELECT
+            event_time,
+            payload->'b' as bids,
+            payload->'a' as asks
+        FROM depth_updates
         WHERE symbol = :symbol AND event_time BETWEEN :start AND :end
         ORDER BY event_time;
     """)
     with engine.connect() as connection:
-        df = pd.read_sql(query, connection, params={'symbol': symbol, 'start': start_date, 'end': end_date},
-                         index_col='event_time', parse_dates=['event_time'])
-    print(f"Loaded {len(df)} depth update records.")
+        df = pd.read_sql(
+            query,
+            connection,
+            params={'symbol': symbol, 'start': start_date, 'end': end_date},
+            index_col='event_time',
+            parse_dates=['event_time']
+        )
+
+    if not df.empty:
+        # Конвертируем числовые значения в списках из строк в float
+        # Это необходимо, так как из JSON они приходят как текст
+        df['bids'] = df['bids'].apply(lambda x: [[float(p), float(q)] for p, q in x])
+        df['asks'] = df['asks'].apply(lambda x: [[float(p), float(q)] for p, q in x])
+
+    print(f"Loaded and processed {len(df)} depth update records.")
     return df
 
 def load_liquidations_data(engine, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -123,6 +147,11 @@ def main():
     parser.add_argument('--delta-window', type=int, default=30, help='Окно для Order Flow Delta.')
     parser.add_argument('--panic-window', type=int, default=30, help='Окно для Panic Index.')
     parser.add_argument('--absorption-window', type=int, default=50, help='Окно для Absorption Strength.')
+    parser.add_argument('--obi-levels', type=int, default=5, help='Количество уровней стакана для OBI.')
+    parser.add_argument('--wall-factor', type=float, default=10.0, help='Множитель для определения "стены".')
+    parser.add_argument('--wall-neighborhood', type=int, default=5, help='Кол-во соседних уровней для анализа стены.')
+    parser.add_argument('--imbalance-ratio', type=float, default=3.0, help='Соотношение для определения дисбаланса футпринта.')
+    parser.add_argument('--imbalance-window', type=int, default=100, help='Окно для скользящей суммы дисбаланса футпринта.')
 
     args = parser.parse_args()
 
@@ -138,8 +167,7 @@ def main():
     # --- 3. Загрузка всех необходимых данных ---
     try:
         trades_df = load_trades_data(engine, args.symbol, args.start, args.end)
-        # В текущей версии признаки не используют данные стакана, но загрузка оставлена для будущего.
-        # depth_df = load_depth_data(engine, args.symbol, args.start, args.end)
+        depth_df = load_depth_data(engine, args.symbol, args.start, args.end)
         liquidations_df = load_liquidations_data(engine, args.symbol, args.start, args.end)
     except Exception as e:
         print(f"\nERROR: Failed to load data from database: {e}")
@@ -151,18 +179,22 @@ def main():
         print("No trade data found for the given period. Exiting.")
         return
 
-    # --- 4. Объединение данных в один DataFrame ---
-    # Это ключевой шаг для работы с асинхронными данными.
-    # Например, сделка и ликвидация могут произойти не в одну и ту же миллисекунду.
-    # `merge_asof` объединяет датафреймы по ближайшему времени.
-    # `direction='backward'` означает, что для каждой сделки в `trades_df`
-    # будет найдено ПОСЛЕДНЕЕ предшествующее ей событие из `liquidations_df`.
-    # Это гарантирует, что мы не используем информацию из будущего.
-    print("Merging data sources...")
-    # В текущей реализации признаки рассчитываются на разных датафреймах,
-    # поэтому основное объединение происходит уже после расчета.
-    # Здесь можно было бы объединять, например, данные стакана, если бы они использовались.
-    merged_df = trades_df # Начинаем с основного датафрейма сделок
+    if depth_df.empty:
+        print("No depth data found for the given period. Footprint indicators cannot be calculated. Exiting.")
+        return
+
+    # --- 4. Объединение данных о сделках и стакане ---
+    # Это ключевой шаг для работы с асинхронными данными. Для каждой сделки
+    # мы находим последнее состояние стакана ПЕРЕД этой сделкой.
+    # Это позволяет нам анализировать, как сделка повлияла на стакан,
+    # который существовал в тот момент.
+    print("Merging trades and depth data...")
+    merged_df = pd.merge_asof(
+        trades_df,
+        depth_df,
+        on='event_time',
+        direction='backward'  # Найти последнее состояние стакана ПЕРЕД сделкой
+    )
 
     # --- 5. Расчет продвинутых индикаторов ---
     print("Calculating advanced features with the following windows:")
@@ -174,6 +206,23 @@ def main():
     merged_df['order_flow_delta'] = calculate_order_flow_delta(merged_df, window=args.delta_window)
     merged_df['absorption_strength'] = calculate_absorption_strength(merged_df, window=args.absorption_window)
     merged_df['panic_index'] = calculate_panic_index(merged_df, window=args.panic_window)
+
+    # Рассчитываем признаки, основанные на данных стакана
+    merged_df['orderbook_imbalance'] = calculate_orderbook_imbalance(merged_df, levels=args.obi_levels)
+
+    wall_features_df = calculate_liquidity_walls(
+        merged_df,
+        wall_factor=args.wall_factor,
+        neighborhood=args.wall_neighborhood
+    )
+    merged_df = pd.concat([merged_df, wall_features_df], axis=1)
+
+    merged_df['footprint_imbalance'] = calculate_footprint_imbalance(
+        merged_df,
+        imbalance_ratio=args.imbalance_ratio,
+        window=args.imbalance_window
+    )
+
 
     # Рассчитываем признаки, зависящие от других потоков данных (ликвидации)
     cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
