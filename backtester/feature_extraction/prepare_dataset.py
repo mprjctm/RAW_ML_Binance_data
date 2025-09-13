@@ -4,6 +4,10 @@ from sqlalchemy import create_engine, text
 import argparse
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения из .env файла в корне проекта
+load_dotenv()
 
 # Импортируем наши новые функции для расчета признаков
 from backtester.feature_extraction.features import (
