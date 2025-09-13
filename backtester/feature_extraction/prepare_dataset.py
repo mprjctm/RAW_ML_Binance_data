@@ -136,16 +136,19 @@ def main():
     if not cascade_exhaustion.empty:
         merged_df = pd.merge_asof(merged_df, cascade_exhaustion.to_frame(name='cascade_exhaustion'), on='event_time', direction='backward')
         # Заполняем NaN, которые появляются из-за редких событий ликвидации
-        merged_df['cascade_exhaustion'].fillna(0, inplace=True)
+        merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
 
     # Очистка от NaN, которые могли появиться в процессе
     merged_df.dropna(inplace=True)
 
     # 4. Сохранение итогового датасета
-    print(f"Saving final dataset to {args.output}...")
+    output_path = os.path.abspath(args.output)
+    print(f"Saving final dataset to {output_path}...")
     try:
-        os.makedirs(os.path.dirname(args.output), exist_ok=True)
-        merged_df.to_parquet(args.output, engine='pyarrow')
+        # Убедимся, что директория для сохранения существует
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+        merged_df.to_parquet(output_path, engine='pyarrow')
         print("Final dataset saved successfully.")
     except Exception as e:
         print(f"Failed to save final dataset: {e}")
