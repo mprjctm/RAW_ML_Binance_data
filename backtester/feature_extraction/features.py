@@ -23,7 +23,7 @@ def calculate_order_flow_delta(df: pd.DataFrame, window: int = 30) -> pd.Series:
     delta_series = pd.Series(delta, index=df.index)
 
     # Суммируем дельту за скользящее окно
-    return delta_series.rolling(window=window).sum()
+    return delta_series.rolling(window=window).sum().rename("order_flow_delta")
 
 
 def calculate_cascade_exhaustion(liquidations_df: pd.DataFrame, window: str = '5min') -> pd.Series:
@@ -56,16 +56,21 @@ def calculate_panic_index(df: pd.DataFrame, window: int = 30) -> pd.Series:
 
     # 2. Всплеск объема (процентное изменение суммы объема)
     volume_sum = df['quantity'].rolling(window=window).sum()
-    volume_roc = volume_sum.pct_change()
+    # Заполняем первый NaN, который появляется из-за pct_change()
+    volume_roc = volume_sum.pct_change().fillna(0)
 
     # Нормализуем оба компонента (от 0 до 1), чтобы их можно было сложить
-    norm_volatility = (volatility - volatility.min()) / (volatility.max() - volatility.min())
-    norm_volume_roc = (volume_roc - volume_roc.min()) / (volume_roc.max() - volume_roc.min())
+    # Добавляем эпсилон (1e-9) в знаменатель, чтобы избежать деления на ноль, если max == min
+    vol_range = volatility.max() - volatility.min()
+    norm_volatility = (volatility - volatility.min()) / (vol_range + 1e-9)
+
+    vol_roc_range = volume_roc.max() - volume_roc.min()
+    norm_volume_roc = (volume_roc - volume_roc.min()) / (vol_roc_range + 1e-9)
 
     # Простой индекс паники - взвешенное среднее
     panic_index = (norm_volatility * 0.6 + norm_volume_roc * 0.4)
 
-    return panic_index
+    return panic_index.rename("panic_index")
 
 
 def calculate_absorption_strength(df: pd.DataFrame, window: int = 50) -> pd.Series:
@@ -94,4 +99,4 @@ def calculate_absorption_strength(df: pd.DataFrame, window: int = 50) -> pd.Seri
     absorption = cumulative_delta / (price_range + 1e-9)
 
     # Мы ищем сильное отрицательное значение (много продаж, малое изменение цены)
-    return absorption
+    return absorption.rename("absorption_strength")
