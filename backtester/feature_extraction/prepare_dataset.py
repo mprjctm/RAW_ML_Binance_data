@@ -76,6 +76,11 @@ def main():
     parser.add_argument('--end', type=str, required=True, help='Дата окончания (ГГГГ-ММ-ДД ЧЧ:ММ:СС).')
     parser.add_argument('--output', type=str, required=True, help='Путь к выходному Parquet файлу.')
 
+    # Аргументы для настройки окон признаков
+    parser.add_argument('--delta-window', type=int, default=30, help='Окно для Order Flow Delta.')
+    parser.add_argument('--panic-window', type=int, default=30, help='Окно для Panic Index.')
+    parser.add_argument('--absorption-window', type=int, default=50, help='Окно для Absorption Strength.')
+
     args = parser.parse_args()
 
     print("--- Starting Data Preparation Pipeline ---")
@@ -109,16 +114,20 @@ def main():
     merged_df = pd.merge_asof(trades_df, depth_df, on='event_time', direction='backward')
 
     # 3. Расчет продвинутых индикаторов
-    print("Calculating advanced features...")
+    print("Calculating advanced features with the following windows:")
+    print(f"  - Order Flow Delta: {args.delta_window}")
+    print(f"  - Panic Index: {args.panic_window}")
+    print(f"  - Absorption Strength: {args.absorption_window}")
 
     # Сначала базовые индикаторы, которые могут понадобиться для продвинутых
-    merged_df['order_flow_delta'] = calculate_order_flow_delta(merged_df)
+    merged_df['order_flow_delta'] = calculate_order_flow_delta(merged_df, window=args.delta_window)
 
     # Теперь продвинутые индикаторы
-    merged_df['absorption_strength'] = calculate_absorption_strength(merged_df)
-    merged_df['panic_index'] = calculate_panic_index(merged_df)
+    merged_df['absorption_strength'] = calculate_absorption_strength(merged_df, window=args.absorption_window)
+    merged_df['panic_index'] = calculate_panic_index(merged_df, window=args.panic_window)
 
     # Расчет истощения каскада требует отдельного датафрейма
+    # Примечание: окно для cascade_exhaustion пока не настраивается, т.к. используется временной интервал
     cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
     if not cascade_exhaustion.empty:
         merged_df = pd.merge_asof(merged_df, cascade_exhaustion.to_frame(name='cascade_exhaustion'), on='event_time', direction='backward')
