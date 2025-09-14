@@ -50,8 +50,10 @@ def export_data_for_chunk(conn, query, output_path, process_func):
     Выполняет запрос для одного "куска" данных, обрабатывает и сохраняет его.
     """
     try:
+
         # Выполняем запрос и загружаем данные в DataFrame
         df = pd.read_sql_query(query, conn)
+
 
         if df.empty:
             return
