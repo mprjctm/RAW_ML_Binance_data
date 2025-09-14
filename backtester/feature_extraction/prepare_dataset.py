@@ -143,8 +143,6 @@ def main():
         )
         merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
 
-    # --- 7. Очистка и сохранение ---
-    merged_df.dropna(inplace=True)
 
     output_path = os.path.abspath(args.output)
     print(f"Saving final dataset to {output_path}...")

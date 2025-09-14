@@ -41,9 +41,11 @@ python -m backtester.feature_extraction.prepare_dataset \
     --depth-file "$RAW_DEPTH_FILE" \
     --liquidations-file "$RAW_LIQUIDATIONS_FILE" \
     --output "$FEATURES_FILE" \
-    # Здесь можно также указать параметры для окон индикаторов, если нужно
-    # --delta-window 30 \
-    # --panic-window 30
+    --delta-window 30 \
+    --panic-window 30 \
+    --absorption-window 50 \
+    --wall-neighborhood 4
+
 
 echo "--- ЭТАП 2 Завершен ---"
 echo "Финальный датасет с признаками сохранен в: $FEATURES_FILE"
