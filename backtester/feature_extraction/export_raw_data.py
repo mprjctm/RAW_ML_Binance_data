@@ -1,181 +1,170 @@
 # -*- coding: utf-8 -*-
 """
-Этот скрипт отвечает за первый этап подготовки данных: экспорт "сырых"
-данных из базы данных PostgreSQL в файлы формата Parquet.
+Этот скрипт представляет собой ETL-конвейер (Extract, Transform, Load) для
+подготовки данных для бэктестинга или обучения моделей.
 
-Это позволяет отделить ресурсоемкую задачу выгрузки данных от задачи их
-обработки и расчета признаков, что дает возможность выполнять эти этапы
-на разных серверах.
+ЭТОТ СКРИПТ НЕ ПОДКЛЮЧАЕТСЯ К БАЗЕ ДАННЫХ.
 
-Скрипт подключается к БД, выполняет SQL-запросы для извлечения данных
-о сделках, стаканах и ликвидациях за указанный период и сохраняет каждый
-тип данных в отдельный файл.
+Он является вторым шагом в пайплайне и работает с "сырыми" данными,
+предварительно выгруженными из БД с помощью скрипта `export_raw_data.py`.
+
+Процесс работы скрипта:
+1.  **Extract**: Загрузка "сырых" данных (сделки, обновления стакана, ликвидации)
+    из Parquet файлов.
+2.  **Transform**:
+    - Объединение разнородных временных рядов в единый DataFrame.
+    - Агрегация данных в OHLCV бары.
+    - Расчет стандартных и кастомных признаков (features).
+    - Очистка данных от пропусков (NaN).
+3.  **Load**: Сохранение итогового, обогащенного признаками датасета в
+    эффективный бинарный формат Parquet.
 """
 import pandas as pd
-from sqlalchemy import create_engine, text
+import numpy as np
 import argparse
 import os
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import pyarrow.parquet as pq
-import pyarrow as pa
 from tqdm import tqdm
 
-# Загружаем переменные окружения (в т.ч. DSN базы данных)
-load_dotenv()
-
-# --- Конфигурация ---
-DB_DSN = os.getenv("DB_DSN", "postgresql://user:password@localhost:5432/binance_data")
-
-# --- Функции Загрузки Данных ---
-
-def load_trades_data(engine, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Загружает данные о сделках (agg_trades) из БД."""
-    print(f"Loading trades data for {symbol}...")
-    query = text("""
-        SELECT
-            event_time,
-            CAST(payload->>'p' AS DECIMAL) AS price,
-            CAST(payload->>'q' AS DECIMAL) AS quantity
-        FROM agg_trades
-        WHERE symbol = :symbol AND event_time BETWEEN :start AND :end
-        ORDER BY event_time;
-    """)
-    with engine.connect() as connection:
-        df = pd.read_sql(
-            query,
-            connection,
-            params={'symbol': symbol, 'start': start_date, 'end': end_date},
-            index_col='event_time',
-            parse_dates=['event_time']
-        )
-    print(f"Loaded {len(df)} trade records.")
-    return df
-
-def load_depth_data(engine, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Загружает данные о состоянии стакана (depth_updates) из БД."""
-    print(f"Loading depth data for {symbol}...")
-    query = text("""
-        SELECT
-            event_time,
-            payload->'b' as bids,
-            payload->'a' as asks
-        FROM depth_updates
-        WHERE symbol = :symbol AND event_time BETWEEN :start AND :end
-        ORDER BY event_time;
-    """)
-    with engine.connect() as connection:
-        df = pd.read_sql(
-            query,
-            connection,
-            params={'symbol': symbol, 'start': start_date, 'end': end_date},
-            index_col='event_time',
-            parse_dates=['event_time']
-        )
-
-    if not df.empty:
-        # Конвертируем числовые значения в списках из строк в float
-        df['bids'] = df['bids'].apply(lambda x: [[float(p), float(q)] for p, q in x])
-        df['asks'] = df['asks'].apply(lambda x: [[float(p), float(q)] for p, q in x])
-    print(f"Loaded and processed {len(df)} depth update records.")
-    return df
-
-def load_liquidations_data(engine, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Загружает данные о принудительных ликвидациях (force_orders)."""
-    print(f"Loading liquidations data for {symbol}...")
-    query = text("""
-        SELECT
-            event_time,
-            CAST(payload->'o'->>'q' AS DECIMAL) as quantity
-        FROM force_orders
-        WHERE payload->'o'->>'s' = :symbol AND event_time BETWEEN :start AND :end
-        ORDER BY event_time;
-    """)
-    with engine.connect() as connection:
-        df = pd.read_sql(query, connection, params={'symbol': symbol, 'start': start_date, 'end': end_date},
-                         index_col='event_time', parse_dates=['event_time'])
-    print(f"Loaded {len(df)} liquidation records.")
-    return df
-
+# Импортируем наши функции для расчета признаков
+from backtester.feature_extraction.features import (
+    calculate_absorption_strength,
+    calculate_cascade_exhaustion,
+    calculate_panic_index,
+    calculate_order_flow_delta,
+    calculate_orderbook_imbalance,
+    calculate_liquidity_walls,
+    calculate_footprint_imbalance,
+    calculate_standard_indicators
+)
 
 def main():
-    """Основная функция для запуска экспорта данных."""
+    """Основная функция для запуска конвейера подготовки данных."""
+    # --- 1. Парсинг аргументов командной строки ---
     parser = argparse.ArgumentParser(
-        description="Экспорт сырых данных из БД в файлы Parquet.",
+        description="Подготовка датасета с признаками на основе сырых данных из файлов.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--symbol', type=str, default='BTCUSDT', help='Торговый символ.')
-    parser.add_argument('--start', type=str, required=True, help='Дата начала (ГГГГ-ММ-ДД ЧЧ:ММ:СС).')
-    parser.add_argument('--end', type=str, required=True, help='Дата окончания (ГГГГ-ММ-ДД ЧЧ:ММ:СС).')
-    parser.add_argument('--out-dir', type=str, default='.', help='Директория для сохранения файлов.')
-    parser.add_argument('--chunk-size-days', type=int, default=7, help='Количество дней для обработки в одной порции (для экономии памяти).')
+    parser.add_argument('--trades-file', type=str, required=True, help='Путь к Parquet файлу со сделками.')
+    parser.add_argument('--depth-file', type=str, required=True, help='Путь к Parquet файлу со стаканами.')
+    parser.add_argument('--liquidations-file', type=str, required=True, help='Путь к Parquet файлу с ликвидациями.')
+    parser.add_argument('--output', type=str, required=True, help='Путь к выходному Parquet файлу с признаками.')
+
+    # Аргументы для настройки окон признаков
+    parser.add_argument('--delta-window', type=int, default=30, help='Окно для Order Flow Delta.')
+    parser.add_argument('--panic-window', type=int, default=30, help='Окно для Panic Index.')
+    parser.add_argument('--absorption-window', type=int, default=50, help='Окно для Absorption Strength.')
+    parser.add_argument('--obi-levels', type=int, default=5, help='Количество уровней стакана для OBI.')
+    parser.add_argument('--wall-factor', type=float, default=10.0, help='Множитель для определения "стены".')
+    parser.add_argument('--wall-neighborhood', type=int, default=5, help='Кол-во соседних уровней для анализа стены.')
+    parser.add_argument('--imbalance-ratio', type=float, default=3.0, help='Соотношение для определения дисбаланса футпринта.')
+    parser.add_argument('--imbalance-window', type=int, default=100, help='Окно для скользящей суммы дисбаланса футпринта.')
 
     args = parser.parse_args()
 
-    print("--- Starting Raw Data Export ---")
+    print("--- Starting Data Preparation Pipeline from Files ---")
 
-    os.makedirs(args.out_dir, exist_ok=True)
-
+    # --- 2. Загрузка всех необходимых данных из файлов ---
     try:
-        engine = create_engine(DB_DSN)
+        print(f"Loading trades from {args.trades_file}...")
+        trades_df = pd.read_parquet(args.trades_file)
+        print(f"Loading depth from {args.depth_file}...")
+        depth_df = pd.read_parquet(args.depth_file)
+        print(f"Loading liquidations from {args.liquidations_file}...")
+        liquidations_df = pd.read_parquet(args.liquidations_file)
+    except FileNotFoundError as e:
+        print(f"
+ERROR: Input file not found: {e}")
+        return
     except Exception as e:
-        print(f"Failed to create database engine: {e}")
+        print(f"
+ERROR: Failed to load data from Parquet files: {e}")
         return
 
-    start_date = datetime.fromisoformat(args.start)
-    end_date = datetime.fromisoformat(args.end)
-    chunk_delta = timedelta(days=args.chunk_size_days)
+    if trades_df.empty:
+        print("No trade data found. Exiting.")
+        return
 
-    output_files = {
-        'trades': os.path.join(args.out_dir, f'{args.symbol}_trades.parquet'),
-        'depth': os.path.join(args.out_dir, f'{args.symbol}_depth.parquet'),
-        'liquidations': os.path.join(args.out_dir, f'{args.symbol}_liquidations.parquet')
+    # --- 3. Объединение данных о сделках и стакане ---
+    print("Merging trades and depth data...")
+    merged_df = pd.merge_asof(
+        left=trades_df,
+        right=depth_df,
+        left_index=True,
+        right_index=True,
+        direction='backward'
+    )
+
+    # --- 4. РЕСЕМПЛИНГ И РАСЧЕТ ИНДИКАТОРОВ ---
+    print("Resampling tick data to 1-minute OHLCV bars...")
+    agg_rules = {
+        'price': ['first', 'max', 'min', 'last'],
+        'quantity': 'sum'
     }
-    for f in output_files.values():
-        if os.path.exists(f):
-            os.remove(f)
-            print(f"Removed existing file: {f}")
+    df_resampled = merged_df.resample('1min').agg(agg_rules)
+    df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
 
-    writers = {}
+    # Рассчитываем стандартные "человеческие" индикаторы на агрегированных данных
+    standard_indicators_df = calculate_standard_indicators(df_resampled)
+    df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
 
+    # --- 5. ОБЪЕДИНЕНИЕ ПРИЗНАКОВ РАЗНЫХ МАСШТАБОВ ---
+    print("Merging resampled indicators back into the main tick-level dataframe...")
+    indicator_cols_to_merge = standard_indicators_df.columns
+    merged_df = pd.merge_asof(
+        left=merged_df,
+        right=df_resampled[indicator_cols_to_merge],
+        on='event_time',
+        direction='backward'
+    )
+
+    # --- 6. Расчет продвинутых индикаторов ---
+    print("Calculating advanced features...")
+
+    # Определяем последовательность шагов для расчета признаков
+    feature_calculation_steps = [
+        ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
+        ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
+        ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
+        ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
+        ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
+    ]
+
+    # Итерируемся по шагам с прогресс-баром
+    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
+        merged_df[feature_name] = feature_func(merged_df)
+
+    # Отдельно рассчитываем признаки, которые возвращают несколько колонок
+    print("Calculating multi-column features (e.g., Liquidity Walls)...")
+    wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
+    merged_df = pd.concat([merged_df, wall_features_df], axis=1)
+    
+    print("Calculating features from other data streams (e.g., Liquidations)...")
+    cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
+    if not cascade_exhaustion.empty:
+        merged_df = pd.merge_asof(
+            merged_df,
+            cascade_exhaustion.to_frame(name='cascade_exhaustion'),
+            on='event_time',
+            direction='backward'
+        )
+        merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
+
+    # --- 7. Очистка и сохранение ---
+    # .dropna() удален, т.к. он слишком агрессивно удаляет строки,
+    # где хотя бы один из множества индикаторов еще не рассчитался.
+    # Обработка NaN - задача этапа моделирования.
+    # merged_df.dropna(inplace=True)
+
+    output_path = os.path.abspath(args.output)
+    print(f"Saving final dataset to {output_path}...")
     try:
-        date_chunks = list(pd.date_range(start=start_date, end=end_date, freq=f'{args.chunk_size_days}D'))
-
-        for current_start in tqdm(date_chunks, desc="Exporting Data Chunks"):
-            current_end = min(current_start + chunk_delta - timedelta(seconds=1), end_date)
-
-            trades_df = load_trades_data(engine, args.symbol, str(current_start), str(current_end))
-            if not trades_df.empty:
-                table = pa.Table.from_pandas(trades_df)
-                if 'trades' not in writers:
-                    writers['trades'] = pq.ParquetWriter(output_files['trades'], table.schema)
-                writers['trades'].write_table(table)
-                print(f"Appended {len(trades_df)} records to trades file.")
-
-            depth_df = load_depth_data(engine, args.symbol, str(current_start), str(current_end))
-            if not depth_df.empty:
-                table = pa.Table.from_pandas(depth_df)
-                if 'depth' not in writers:
-                    writers['depth'] = pq.ParquetWriter(output_files['depth'], table.schema)
-                writers['depth'].write_table(table)
-                print(f"Appended {len(depth_df)} records to depth file.")
-
-            liquidations_df = load_liquidations_data(engine, args.symbol, str(current_start), str(current_end))
-            if not liquidations_df.empty:
-                table = pa.Table.from_pandas(liquidations_df)
-                if 'liquidations' not in writers:
-                    writers['liquidations'] = pq.ParquetWriter(output_files['liquidations'], table.schema)
-                writers['liquidations'].write_table(table)
-                print(f"Appended {len(liquidations_df)} records to liquidations file.")
-
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        merged_df.to_parquet(output_path, engine='pyarrow')
+        print("Final dataset saved successfully.")
     except Exception as e:
-        print(f"\nFATAL ERROR during processing: {e}")
-    finally:
-        print("\nClosing Parquet writers...")
-        for writer in writers.values():
-            writer.close()
+        print(f"Failed to save final dataset: {e}")
 
-    print("--- Data Export Finished ---")
+    print("--- Pipeline Finished ---")
 
 if __name__ == "__main__":
     main()

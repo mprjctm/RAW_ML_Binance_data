@@ -72,10 +72,12 @@ def main():
         print(f"Loading liquidations from {args.liquidations_file}...")
         liquidations_df = pd.read_parquet(args.liquidations_file)
     except FileNotFoundError as e:
-        print(f"\nERROR: Input file not found: {e}")
+        print(f"
+ERROR: Input file not found: {e}")
         return
     except Exception as e:
-        print(f"\nERROR: Failed to load data from Parquet files: {e}")
+        print(f"
+ERROR: Failed to load data from Parquet files: {e}")
         return
 
     if trades_df.empty:
@@ -135,7 +137,7 @@ def main():
     print("Calculating multi-column features (e.g., Liquidity Walls)...")
     wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
     merged_df = pd.concat([merged_df, wall_features_df], axis=1)
-
+    
     print("Calculating features from other data streams (e.g., Liquidations)...")
     cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
     if not cascade_exhaustion.empty:
