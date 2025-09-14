@@ -143,11 +143,6 @@ def main():
         )
         merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
 
-    # --- 7. Очистка и сохранение ---
-    # .dropna() удален, т.к. он слишком агрессивно удаляет строки,
-    # где хотя бы один из множества индикаторов еще не рассчитался.
-    # Обработка NaN - задача этапа моделирования.
-    # merged_df.dropna(inplace=True)
 
     output_path = os.path.abspath(args.output)
     print(f"Saving final dataset to {output_path}...")

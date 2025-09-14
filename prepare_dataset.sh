@@ -46,5 +46,6 @@ python -m backtester.feature_extraction.prepare_dataset \
     --absorption-window 50 \
     --wall-neighborhood 4
 
+
 echo "--- ЭТАП 2 Завершен ---"
 echo "Финальный датасет с признаками сохранен в: $FEATURES_FILE"
