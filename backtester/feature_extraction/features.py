@@ -236,8 +236,9 @@ def calculate_orderbook_imbalance(df: pd.DataFrame, levels: int = 5) -> pd.Serie
         bids = row['bids']
         asks = row['asks']
 
-        # Проверяем, что данные не пустые
-        if not bids or not asks:
+        # Проверяем, что данные не пустые. Прямая проверка `if not bids` может
+        # вызвать ValueError для сложных объектов. Явная проверка надежнее.
+        if bids is None or asks is None or len(bids) == 0 or len(asks) == 0:
             return 0.0
 
         # Суммируем объемы на заданном количестве уровней
@@ -290,7 +291,7 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
         buy_wall_price, buy_wall_vol, sell_wall_price, sell_wall_vol = np.nan, np.nan, np.nan, np.nan
 
         # --- Поиск стены на покупку (bids) ---
-        if row['bids'] and len(row['bids']) > neighborhood:
+        if row['bids'] is not None and len(row['bids']) > neighborhood:
             volumes = [b[1] for b in row['bids']]
             for i in range(len(volumes)):
                 # Явное и более надежное формирование списка соседних объемов
@@ -313,7 +314,7 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
                     break  # Нашли ближайшую стену, выходим
 
         # --- Поиск стены на продажу (asks) ---
-        if row['asks'] and len(row['asks']) > neighborhood:
+        if row['asks'] is not None and len(row['asks']) > neighborhood:
             volumes = [a[1] for a in row['asks']]
             for i in range(len(volumes)):
                 neighbors = []
@@ -383,7 +384,8 @@ def calculate_footprint_imbalance(df: pd.DataFrame, imbalance_ratio: float = 3.0
 
     # Шаг 1: Определяем агрессора для каждой сделки
     def get_aggressor(row):
-        if not row['bids'] or not row['asks']: return 'neutral'
+        if row['bids'] is None or row['asks'] is None or len(row['bids']) == 0 or len(row['asks']) == 0:
+            return 'neutral'
         best_bid = row['bids'][0][0]
         best_ask = row['asks'][0][0]
         if row['price'] >= best_ask: return 'buy'
