@@ -15,7 +15,10 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import argparse
 import os
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 # Загружаем переменные окружения (в т.ч. DSN базы данных)
 load_dotenv()
@@ -104,6 +107,7 @@ def main():
     parser.add_argument('--start', type=str, required=True, help='Дата начала (ГГГГ-ММ-ДД ЧЧ:ММ:СС).')
     parser.add_argument('--end', type=str, required=True, help='Дата окончания (ГГГГ-ММ-ДД ЧЧ:ММ:СС).')
     parser.add_argument('--out-dir', type=str, default='.', help='Директория для сохранения файлов.')
+    parser.add_argument('--chunk-size-days', type=int, default=7, help='Количество дней для обработки в одной порции (для экономии памяти).')
 
     args = parser.parse_args()
 
@@ -119,30 +123,67 @@ def main():
         print(f"Failed to create database engine: {e}")
         return
 
-    # Загрузка и сохранение каждого типа данных
+    # --- Логика обработки по порциям (чанками) ---
+    start_date = datetime.fromisoformat(args.start)
+    end_date = datetime.fromisoformat(args.end)
+    chunk_delta = timedelta(days=args.chunk_size_days)
+
+    # Определяем пути к файлам и удаляем старые файлы, если они существуют
+    output_files = {
+        'trades': os.path.join(args.out_dir, f'{args.symbol}_trades.parquet'),
+        'depth': os.path.join(args.out_dir, f'{args.symbol}_depth.parquet'),
+        'liquidations': os.path.join(args.out_dir, f'{args.symbol}_liquidations.parquet')
+    }
+    for f in output_files.values():
+        if os.path.exists(f):
+            os.remove(f)
+            print(f"Removed existing file: {f}")
+
+    # Словарь для хранения ParquetWriters
+    writers = {}
+
     try:
-        # Сделки
-        trades_df = load_trades_data(engine, args.symbol, args.start, args.end)
-        if not trades_df.empty:
-            trades_df.to_parquet(os.path.join(args.out_dir, f'{args.symbol}_trades.parquet'))
-            print(f"Saved trades data to {args.out_dir}")
+        current_start = start_date
+        while current_start < end_date:
+            current_end = min(current_start + chunk_delta, end_date)
+            print(f"\n--- Processing chunk: {current_start.date()} to {current_end.date()} ---")
 
-        # Стаканы
-        depth_df = load_depth_data(engine, args.symbol, args.start, args.end)
-        if not depth_df.empty:
-            depth_df.to_parquet(os.path.join(args.out_dir, f'{args.symbol}_depth.parquet'))
-            print(f"Saved depth data to {args.out_dir}")
+            # --- Обработка сделок (trades) ---
+            trades_df = load_trades_data(engine, args.symbol, str(current_start), str(current_end))
+            if not trades_df.empty:
+                table = pa.Table.from_pandas(trades_df)
+                if 'trades' not in writers:
+                    writers['trades'] = pq.ParquetWriter(output_files['trades'], table.schema)
+                writers['trades'].write_table(table)
+                print(f"Appended {len(trades_df)} records to trades file.")
 
-        # Ликвидации
-        liquidations_df = load_liquidations_data(engine, args.symbol, args.start, args.end)
-        if not liquidations_df.empty:
-            liquidations_df.to_parquet(os.path.join(args.out_dir, f'{args.symbol}_liquidations.parquet'))
-            print(f"Saved liquidations data to {args.out_dir}")
+            # --- Обработка стаканов (depth) ---
+            depth_df = load_depth_data(engine, args.symbol, str(current_start), str(current_end))
+            if not depth_df.empty:
+                table = pa.Table.from_pandas(depth_df)
+                if 'depth' not in writers:
+                    writers['depth'] = pq.ParquetWriter(output_files['depth'], table.schema)
+                writers['depth'].write_table(table)
+                print(f"Appended {len(depth_df)} records to depth file.")
+
+            # --- Обработка ликвидаций (liquidations) ---
+            liquidations_df = load_liquidations_data(engine, args.symbol, str(current_start), str(current_end))
+            if not liquidations_df.empty:
+                table = pa.Table.from_pandas(liquidations_df)
+                if 'liquidations' not in writers:
+                    writers['liquidations'] = pq.ParquetWriter(output_files['liquidations'], table.schema)
+                writers['liquidations'].write_table(table)
+                print(f"Appended {len(liquidations_df)} records to liquidations file.")
+
+            current_start += chunk_delta
 
     except Exception as e:
-        print(f"\nERROR: Failed to load or save data: {e}")
-        print("NOTE: This is expected in the sandbox environment without a running DB.")
-        return
+        print(f"\nFATAL ERROR during processing: {e}")
+    finally:
+        # Корректно закрываем все открытые writers
+        print("\nClosing Parquet writers...")
+        for writer in writers.values():
+            writer.close()
 
     print("--- Data Export Finished ---")
 

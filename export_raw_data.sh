@@ -9,6 +9,7 @@ SYMBOL="BTCUSDT"
 START_DATE="2023-01-01 00:00:00"
 END_DATE="2023-01-31 23:59:59"
 OUT_DIR="raw_data" # Директория для сохранения сырых данных
+CHUNK_SIZE_DAYS=7 # Обрабатывать по 7 дней за раз для экономии памяти
 
 # --- Команда запуска ---
 echo "Запуск экспорта сырых данных для символа $SYMBOL..."
@@ -19,6 +20,7 @@ python -m backtester.feature_extraction.export_raw_data \
     --symbol "$SYMBOL" \
     --start "$START_DATE" \
     --end "$END_DATE" \
-    --out-dir "$OUT_DIR"
+    --out-dir "$OUT_DIR" \
+    --chunk-size-days "$CHUNK_SIZE_DAYS"
 
 echo "Экспорт успешно завершен."
