@@ -11,3 +11,4 @@ pandas
 numpy
 pyarrow
 psycopg2-binary
+tqdm
