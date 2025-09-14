@@ -1,47 +1,42 @@
 #!/bin/bash
-# Этот скрипт запускает полный двухэтапный конвейер подготовки данных.
-# 1. Экспорт сырых данных из базы данных в Parquet файлы.
-# 2. Расчет всех индикаторов и создание финального датасета с признаками.
 
-set -e # Прерывать выполнение скрипта при любой ошибке
+# Этот скрипт запускает подготовку датасета с заданными параметрами.
+# Отредактируйте переменные ниже, чтобы изменить параметры запуска.
 
 # --- Основные параметры ---
 SYMBOL="BTCUSDT"
 START_DATE="2023-01-01 00:00:00"
-END_DATE="2023-12-31 23:59:59"
+END_DATE="2026-12-31 23:59:59"
+OUTPUT_FILE="btc_features_ws60.parquet"
 
-# --- Параметры для директорий и файлов ---
-RAW_DATA_DIR="raw_data"
-FEATURES_FILE="features.parquet"
+# --- Параметры индикаторов на основе потока сделок ---
+DELTA_WINDOW=30
+PANIC_WINDOW=30
+ABSORPTION_WINDOW=50
 
-# Создаем директорию для сырых данных, если ее нет
-mkdir -p "$RAW_DATA_DIR"
+# --- Параметры индикаторов на основе стакана ---
+OBI_LEVELS=5
+WALL_FACTOR=10.0
+WALL_NEIGHBORHOOD=5
+IMBALANCE_RATIO=3.0
+IMBALANCE_WINDOW=100
 
-# Определяем пути к файлам
-RAW_TRADES_FILE="$RAW_DATA_DIR/${SYMBOL}_trades.parquet"
-RAW_DEPTH_FILE="$RAW_DATA_DIR/${SYMBOL}_depth.parquet"
-RAW_LIQUIDATIONS_FILE="$RAW_DATA_DIR/${SYMBOL}_liquidations.parquet"
 
-# --- ЭТАП 1: Экспорт сырых данных ---
-echo "--- Запуск ЭТАПА 1: Экспорт сырых данных из БД ---"
-python -m backtester.feature_extraction.export_raw_data \
+# --- Команда запуска ---
+echo "Запуск подготовки датасета для символа $SYMBOL..."
+
+python -m backtester.feature_extraction.prepare_dataset \
     --symbol "$SYMBOL" \
     --start "$START_DATE" \
     --end "$END_DATE" \
-    --out-dir "$RAW_DATA_DIR"
-echo "--- ЭТАП 1 Завершен ---"
+    --output "$OUTPUT_FILE" \
+    --delta-window "$DELTA_WINDOW" \
+    --panic-window "$PANIC_WINDOW" \
+    --absorption-window "$ABSORPTION_WINDOW" \
+    --obi-levels "$OBI_LEVELS" \
+    --wall-factor "$WALL_FACTOR" \
+    --wall-neighborhood "$WALL_NEIGHBORHOOD" \
+    --imbalance-ratio "$IMBALANCE_RATIO" \
+    --imbalance-window "$IMBALANCE_WINDOW"
 
-
-# --- ЭТАП 2: Расчет признаков из сырых файлов ---
-echo -e "\n--- Запуск ЭТАПА 2: Расчет признаков ---"
-python -m backtester.feature_extraction.prepare_dataset \
-    --trades-file "$RAW_TRADES_FILE" \
-    --depth-file "$RAW_DEPTH_FILE" \
-    --liquidations-file "$RAW_LIQUIDATIONS_FILE" \
-    --output "$FEATURES_FILE" \
-    # Здесь можно также указать параметры для окон индикаторов, если нужно
-    # --delta-window 30 \
-    # --panic-window 30
-
-echo "--- ЭТАП 2 Завершен ---"
-echo "Финальный датасет с признаками сохранен в: $FEATURES_FILE"
+echo "Скрипт завершил работу."
