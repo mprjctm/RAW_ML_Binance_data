@@ -23,6 +23,7 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
+from tqdm import tqdm
 
 # Импортируем наши функции для расчета признаков
 from backtester.feature_extraction.features import (
@@ -71,10 +72,12 @@ def main():
         print(f"Loading liquidations from {args.liquidations_file}...")
         liquidations_df = pd.read_parquet(args.liquidations_file)
     except FileNotFoundError as e:
-        print(f"\nERROR: Input file not found: {e}")
+        print(f"
+ERROR: Input file not found: {e}")
         return
     except Exception as e:
-        print(f"\nERROR: Failed to load data from Parquet files: {e}")
+        print(f"
+ERROR: Failed to load data from Parquet files: {e}")
         return
 
     if trades_df.empty:
@@ -117,6 +120,7 @@ def main():
     # --- 6. Расчет продвинутых индикаторов ---
     print("Calculating advanced features...")
 
+    # Определяем последовательность шагов для расчета признаков
     feature_calculation_steps = [
         ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
         ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
@@ -125,13 +129,15 @@ def main():
         ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
     ]
 
-    for feature_name, feature_func in feature_calculation_steps:
+    # Итерируемся по шагам с прогресс-баром
+    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
         merged_df[feature_name] = feature_func(merged_df)
 
+    # Отдельно рассчитываем признаки, которые возвращают несколько колонок
     print("Calculating multi-column features (e.g., Liquidity Walls)...")
     wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
     merged_df = pd.concat([merged_df, wall_features_df], axis=1)
-
+    
     print("Calculating features from other data streams (e.g., Liquidations)...")
     cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
     if not cascade_exhaustion.empty:
@@ -143,6 +149,11 @@ def main():
         )
         merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
 
+    # --- 7. Очистка и сохранение ---
+    # .dropna() удален, т.к. он слишком агрессивно удаляет строки,
+    # где хотя бы один из множества индикаторов еще не рассчитался.
+    # Обработка NaN - задача этапа моделирования.
+    # merged_df.dropna(inplace=True)
 
     output_path = os.path.abspath(args.output)
     print(f"Saving final dataset to {output_path}...")
