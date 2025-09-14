@@ -62,10 +62,13 @@ def export_data_for_chunk(conn, query: str, params: Dict[str, Any], output_path:
         df = process_func(df)
 
         # Дописываем данные в Parquet файл
+        # Используем fastparquet, т.к. он корректно поддерживает дозапись (append=True)
         if os.path.exists(output_path):
-            df.to_parquet(output_path, engine='pyarrow', append=True)
+            df.to_parquet(output_path, engine='fastparquet', append=True)
         else:
-            df.to_parquet(output_path, engine='pyarrow')
+            df.to_parquet(output_path, engine='fastparquet')
+
+        return True
 
         return True
 
