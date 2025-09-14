@@ -72,12 +72,12 @@ def main():
         print(f"Loading liquidations from {args.liquidations_file}...")
         liquidations_df = pd.read_parquet(args.liquidations_file)
     except FileNotFoundError as e:
-        print(f"
-ERROR: Input file not found: {e}")
+        print(f"""
+ERROR: Input file not found: {e}""")
         return
     except Exception as e:
-        print(f"
-ERROR: Failed to load data from Parquet files: {e}")
+        print(f"""
+ERROR: Failed to load data from Parquet files: {e}""")
         return
 
     if trades_df.empty:
