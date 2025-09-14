@@ -430,3 +430,47 @@ def calculate_footprint_imbalance(df: pd.DataFrame, imbalance_ratio: float = 3.0
 
     # Возвращаем скользящую сумму чистого дисбаланса
     return net_imbalance.rolling(window=window).sum().rename('footprint_imbalance')
+
+
+# --- Функции для стандартных ("человеческих") индикаторов ---
+
+def calculate_standard_indicators(df_ohlcv: pd.DataFrame, ema_fast: int = 9, ema_slow: int = 21, rsi_period: int = 7, bb_period: int = 20, bb_std: int = 2) -> pd.DataFrame:
+    """
+    Рассчитывает набор стандартных технических индикаторов с помощью библиотеки pandas-ta.
+
+    Эта функция-обертка добавляет к исходному DataFrame следующие индикаторы:
+    - EMA (Экспоненциальная скользящая средняя): Быстрая и медленная.
+    - VWAP (Volume-Weighted Average Price): Средневзвешенная по объему цена.
+    - RSI (Индекс относительной силы): Индикатор импульса.
+    - Bollinger Bands (Полосы Боллинджера): Оценка волатильности.
+
+    Args:
+        df_ohlcv (pd.DataFrame): DataFrame с колонками 'open', 'high', 'low', 'close', 'volume'.
+        ema_fast (int): Период для быстрой EMA.
+        ema_slow (int): Период для медленной EMA.
+        rsi_period (int): Период для RSI.
+        bb_period (int): Период для Полос Боллинджера.
+        bb_std (int): Количество стандартных отклонений для Полос Боллинджера.
+
+    Returns:
+        pd.DataFrame: DataFrame с добавленными колонками индикаторов.
+    """
+    print("Calculating standard technical indicators (EMA, VWAP, RSI, BBands)...")
+
+    # Создаем копию, чтобы не изменять исходный DataFrame
+    df_ta = df_ohlcv.copy()
+
+    # Импортируем pandas_ta здесь, чтобы избежать циклического импорта
+    import pandas_ta as ta
+
+    # Рассчитываем индикаторы, добавляя их в df_ta
+    df_ta.ta.ema(length=ema_fast, append=True)
+    df_ta.ta.ema(length=ema_slow, append=True)
+    df_ta.ta.vwap(append=True)
+    df_ta.ta.rsi(length=rsi_period, append=True)
+    df_ta.ta.bbands(length=bb_period, std=bb_std, append=True)
+
+    # Возвращаем только новые колонки с индикаторами
+    # Исходные колонки ohlcv уже есть в df_resampled
+    new_cols = [col for col in df_ta.columns if col not in df_ohlcv.columns]
+    return df_ta[new_cols]

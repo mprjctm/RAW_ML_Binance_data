@@ -37,7 +37,8 @@ from backtester.feature_extraction.features import (
     calculate_order_flow_delta,
     calculate_orderbook_imbalance,
     calculate_liquidity_walls,
-    calculate_footprint_imbalance
+    calculate_footprint_imbalance,
+    calculate_standard_indicators
 )
 
 # --- Конфигурация ---
@@ -196,11 +197,40 @@ def main():
         direction='backward'  # Найти последнее состояние стакана ПЕРЕД сделкой
     )
 
-    # --- 5. Расчет продвинутых индикаторов ---
+    # --- 5. РЕСЕМПЛИНГ И РАСЧЕТ ИНДИКАТОРОВ ---
+    print("Resampling tick data to 1-minute OHLCV bars...")
+    # Правила для агрегации данных в свечи
+    agg_rules = {
+        'price': ['first', 'max', 'min', 'last'],
+        'quantity': 'sum'
+    }
+    df_resampled = merged_df.resample('1T').agg(agg_rules)
+    # Переименовываем колонки в стандартный формат ohlc/volume
+    df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+
+    # --- 6. Расчет продвинутых индикаторов ---
     print("Calculating advanced features with the following windows:")
     print(f"  - Order Flow Delta: {args.delta_window}")
     print(f"  - Panic Index: {args.panic_window}")
     print(f"  - Absorption Strength: {args.absorption_window}")
+
+    # Рассчитываем стандартные "человеческие" индикаторы на агрегированных данных
+    standard_indicators_df = calculate_standard_indicators(df_resampled)
+    # Теперь df_resampled содержит и ohlcv, и стандартные индикаторы
+    df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
+
+    # --- 7. ОБЪЕДИНЕНИЕ ПРИЗНАКОВ РАЗНЫХ МАСШТАБОВ ---
+    print("Merging resampled indicators back into the main tick-level dataframe...")
+    # Оставляем только колонки с индикаторами для объединения
+    indicator_cols_to_merge = standard_indicators_df.columns
+    # Используем merge_asof для присвоения каждому тику значения индикатора
+    # с последней доступной минутной свечи (эффект forward-fill)
+    merged_df = pd.merge_asof(
+        left=merged_df,
+        right=df_resampled[indicator_cols_to_merge],
+        on='event_time',
+        direction='backward'
+    )
 
     # Рассчитываем признаки, которые зависят только от потока сделок
     merged_df['order_flow_delta'] = calculate_order_flow_delta(merged_df, window=args.delta_window)
