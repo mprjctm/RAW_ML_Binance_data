@@ -113,7 +113,10 @@ def main():
         try:
             # Загружаем основные данные для чанка
             time_filter = [('event_time', '>=', chunk_start), ('event_time', '<', chunk_end)]
+
             trades_df_chunk = pd.read_parquet(args.trades_file, filters=time_filter, columns=['price', 'quantity'])
+
+
 
             if trades_df_chunk.empty and overlap_df.empty:
                 print("В данном чанке и в буфере перекрытия нет сделок. Пропускаем."); continue
@@ -124,10 +127,17 @@ def main():
             # Загружаем соответствующие данные из других файлов
             overlap_start_time = trades_df_with_overlap.index.min()
             full_chunk_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
+            
+            
+
             depth_df = pd.read_parquet(args.depth_file, filters=full_chunk_filter, columns=['bids', 'asks'])
 
             liquidations_time_filter = [('time', '>=', overlap_start_time), ('time', '<', chunk_end)]
             liquidations_df = pd.read_parquet(args.liquidations_file, filters=liquidations_time_filter, columns=['quantity'])
+
+
+
+
         except Exception as e:
             print(f"ERROR: Не удалось загрузить данные для чанка: {e}"); continue
 
