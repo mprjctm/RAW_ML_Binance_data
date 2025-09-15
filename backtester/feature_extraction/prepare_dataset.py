@@ -25,8 +25,8 @@ import argparse
 import os
 import orjson
 from tqdm import tqdm
-import functools
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import platform
+import resource
 
 # Импортируем наши функции для расчета признаков
 from backtester.feature_extraction.features import (
@@ -89,6 +89,18 @@ def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     """Основная функция для запуска конвейера подготовки данных."""
+    # --- Установка лимита по памяти (только для Unix) ---
+    if platform.system() == "Linux" or platform.system() == "Darwin":
+        try:
+            memory_limit_gb = 5
+            memory_limit_bytes = memory_limit_gb * 1024 * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+            print(f"Установлен лимит памяти: {memory_limit_gb} GB")
+        except (ValueError, resource.error) as e:
+            print(f"Не удалось установить лимит памяти: {e}")
+    else:
+        print("Ограничение по памяти не поддерживается в текущей ОС.")
+
     # --- 1. Парсинг аргументов командной строки ---
     parser = argparse.ArgumentParser(
         description="Подготовка датасета с признаками на основе сырых данных из файлов.",
@@ -169,41 +181,23 @@ def main():
     )
 
     # --- 6. Расчет продвинутых индикаторов ---
-    print("Calculating advanced features in parallel (using 4 cores)...")
+    print("Calculating advanced features sequentially...")
 
     # Определяем последовательность шагов для расчета признаков.
-    # Используем functools.partial для "замораживания" аргументов,
-    # что более надежно для мультипроцессинга, чем lambda.
     feature_calculation_steps = [
-        ('order_flow_delta', functools.partial(calculate_order_flow_delta, window=args.delta_window)),
-        ('absorption_strength', functools.partial(calculate_absorption_strength, window=args.absorption_window)),
-        ('panic_index', functools.partial(calculate_panic_index, window=args.panic_window)),
-        ('orderbook_imbalance', functools.partial(calculate_orderbook_imbalance, levels=args.obi_levels)),
-        ('footprint_imbalance', functools.partial(calculate_footprint_imbalance, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
+        ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
+        ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
+        ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
+        ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
+        ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
     ]
 
-    # Используем ProcessPoolExecutor для параллельного выполнения задач
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        # Отправляем задачи на выполнение
-        future_to_feature = {
-            executor.submit(feature_func, merged_df): feature_name
-            for feature_name, feature_func in feature_calculation_steps
-        }
-
-        # Собираем результаты по мере их готовности и отображаем прогресс
-        results = {}
-        for future in tqdm(as_completed(future_to_feature), total=len(feature_calculation_steps), desc="Calculating AI Features"):
-            feature_name = future_to_feature[future]
-            try:
-                feature_series = future.result()
-                results[feature_name] = feature_series
-            except Exception as exc:
-                print(f"ERROR: Feature '{feature_name}' generated an exception: {exc}")
-
-    # Объединяем результаты с основным DataFrame
-    print("Concatenating parallel results...")
-    for feature_name, feature_series in results.items():
-        merged_df[feature_name] = feature_series
+    # Последовательно выполняем каждый шаг расчета
+    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
+        try:
+            merged_df[feature_name] = feature_func(merged_df)
+        except Exception as exc:
+            print(f"ERROR: Feature '{feature_name}' generated an exception: {exc}")
 
     # Отдельно рассчитываем признаки, которые возвращают несколько колонок
     print("Calculating multi-column features (e.g., Liquidity Walls)...")
