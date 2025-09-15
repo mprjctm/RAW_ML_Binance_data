@@ -44,7 +44,11 @@ python -m backtester.feature_extraction.prepare_dataset \
     --delta-window 30 \
     --panic-window 30 \
     --absorption-window 50 \
-    --wall-neighborhood 4
+    --obi-levels 5 \
+    --wall-factor 10.0 \
+    --wall-neighborhood 4 \
+    --imbalance-ratio 3.0 \
+    --imbalance-window 100
 
 echo "--- ЭТАП 2 Завершен ---"
 echo "Финальный датасет с признаками сохранен в: $FEATURES_FILE"
