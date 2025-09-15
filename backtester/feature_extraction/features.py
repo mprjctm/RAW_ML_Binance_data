@@ -7,6 +7,7 @@
 """
 import pandas as pd
 import numpy as np
+import orjson
 
 
 def calculate_order_flow_delta(df: pd.DataFrame, window: int = 30) -> pd.Series:
@@ -199,6 +200,20 @@ def calculate_absorption_strength(df: pd.DataFrame, window: int = 50) -> pd.Seri
     return absorption.rename("absorption_strength")
 
 
+def _parse_orderbook_json(data):
+    """
+    Безопасно парсит данные стакана, которые могут быть строкой.
+    Если данные - это строка, пытается декодировать ее из JSON.
+    В случае ошибки или если данные - None, возвращает пустой список.
+    """
+    if isinstance(data, str):
+        try:
+            return orjson.loads(data)
+        except orjson.JSONDecodeError:
+            return []
+    return data if data is not None else []
+
+
 def calculate_orderbook_imbalance(df: pd.DataFrame, levels: int = 5) -> pd.Series:
     """
     Рассчитывает Дисбаланс Объема в Стакане (Order Book Imbalance, OBI).
@@ -232,13 +247,12 @@ def calculate_orderbook_imbalance(df: pd.DataFrame, levels: int = 5) -> pd.Serie
     print("Calculating Order Book Imbalance...")
 
     def get_imbalance(row, level_count):
-        # Извлекаем списки бидов и асков для текущей строки
-        bids = row['bids']
-        asks = row['asks']
+        # Безопасно парсим данные, которые могут быть JSON-строкой
+        bids = _parse_orderbook_json(row['bids'])
+        asks = _parse_orderbook_json(row['asks'])
 
-        # Проверяем, что данные не пустые. Прямая проверка `if not bids` может
-        # вызвать ValueError для сложных объектов. Явная проверка надежнее.
-        if bids is None or asks is None or len(bids) == 0 or len(asks) == 0:
+        # Проверяем, что данные не пустые.
+        if not bids or not asks:
             return 0.0
 
         # Суммируем объемы на заданном количестве уровней
@@ -290,9 +304,12 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
         # Инициализируем переменные со значениями по умолчанию (NaN)
         buy_wall_price, buy_wall_vol, sell_wall_price, sell_wall_vol = np.nan, np.nan, np.nan, np.nan
 
+        bids = _parse_orderbook_json(row['bids'])
+        asks = _parse_orderbook_json(row['asks'])
+
         # --- Поиск стены на покупку (bids) ---
-        if row['bids'] is not None and len(row['bids']) > neighborhood:
-            volumes = [b[1] for b in row['bids']]
+        if len(bids) > neighborhood:
+            volumes = [b[1] for b in bids]
             for i in range(len(volumes)):
                 # Явное и более надежное формирование списка соседних объемов
                 neighbors = []
@@ -309,13 +326,13 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
 
                 # Если объем на уровне аномально большой - это стена
                 if avg_vol > 0 and volumes[i] / avg_vol >= wall_factor:
-                    buy_wall_price = row['bids'][i][0]
+                    buy_wall_price = bids[i][0]
                     buy_wall_vol = volumes[i]
                     break  # Нашли ближайшую стену, выходим
 
         # --- Поиск стены на продажу (asks) ---
-        if row['asks'] is not None and len(row['asks']) > neighborhood:
-            volumes = [a[1] for a in row['asks']]
+        if len(asks) > neighborhood:
+            volumes = [a[1] for a in asks]
             for i in range(len(volumes)):
                 neighbors = []
                 if i > 0:
@@ -328,7 +345,7 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
                 avg_vol = np.mean(neighbors)
 
                 if avg_vol > 0 and volumes[i] / avg_vol >= wall_factor:
-                    sell_wall_price = row['asks'][i][0]
+                    sell_wall_price = asks[i][0]
                     sell_wall_vol = volumes[i]
                     break
 
@@ -384,10 +401,12 @@ def calculate_footprint_imbalance(df: pd.DataFrame, imbalance_ratio: float = 3.0
 
     # Шаг 1: Определяем агрессора для каждой сделки
     def get_aggressor(row):
-        if row['bids'] is None or row['asks'] is None or len(row['bids']) == 0 or len(row['asks']) == 0:
+        bids = _parse_orderbook_json(row['bids'])
+        asks = _parse_orderbook_json(row['asks'])
+        if not bids or not asks:
             return 'neutral'
-        best_bid = row['bids'][0][0]
-        best_ask = row['asks'][0][0]
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
         if row['price'] >= best_ask: return 'buy'
         if row['price'] <= best_bid: return 'sell'
         return 'neutral'
