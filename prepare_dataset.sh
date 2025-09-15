@@ -48,7 +48,9 @@ python -m backtester.feature_extraction.prepare_dataset \
     --wall-factor 10.0 \
     --wall-neighborhood 4 \
     --imbalance-ratio 3.0 \
-    --imbalance-window 100
+    --imbalance-window 100 \
+    --chunk-size '1D' \
+    --memory-limit 5
 
 echo "--- ЭТАП 2 Завершен ---"
 echo "Финальный датасет с признаками сохранен в: $FEATURES_FILE"
