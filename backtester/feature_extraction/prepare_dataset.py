@@ -3,21 +3,10 @@
 Этот скрипт представляет собой ETL-конвейер (Extract, Transform, Load) для
 подготовки данных для бэктестинга или обучения моделей.
 
-ЭТОТ СКРИПТ НЕ ПОДКЛЮЧАЕТСЯ К БАЗЕ ДАННЫХ.
-
-Он является вторым шагом в пайплайне и работает с "сырыми" данными,
-предварительно выгруженными из БД с помощью скрипта `export_raw_data.py`.
-
-Процесс работы скрипта:
-1.  **Extract**: Загрузка "сырых" данных (сделки, обновления стакана, ликвидации)
-    из Parquet файлов.
-2.  **Transform**:
-    - Объединение разнородных временных рядов в единый DataFrame.
-    - Агрегация данных в OHLCV бары.
-    - Расчет стандартных и кастомных признаков (features).
-    - Очистка данных от пропусков (NaN).
-3.  **Load**: Сохранение итогового, обогащенного признаками датасета в
-    эффективный бинарный формат Parquet.
+Он работает с "сырыми" данными, предварительно выгруженными из БД,
+и обрабатывает их по частям (чанками), чтобы избежать проблем с нехваткой
+памяти на больших наборах данных. Для корректного расчета скользящих
+индикаторов используется механизм перекрытия (overlap).
 """
 import pandas as pd
 import numpy as np
@@ -26,9 +15,12 @@ import os
 import orjson
 from tqdm import tqdm
 import platform
-import resource
 
-# Импортируем наши функции для расчета признаков
+try:
+    import resource
+except ImportError:
+    resource = None
+
 from backtester.feature_extraction.features import (
     calculate_absorption_strength,
     calculate_cascade_exhaustion,
@@ -40,195 +32,163 @@ from backtester.feature_extraction.features import (
     calculate_standard_indicators
 )
 
-
 def _parse_and_convert_to_float(data):
-    """
-    Парсит JSON-строку и преобразует все вложенные числовые строки в float.
-    Также обрабатывает данные, которые уже являются списками, но содержат строки.
-    """
     if isinstance(data, str):
-        try:
-            # Если данные - это строка, парсим ее как JSON
-            parsed_data = orjson.loads(data)
-        except orjson.JSONDecodeError:
-            return []  # В случае ошибки парсинга возвращаем пустой список
-    elif hasattr(data, '__iter__'):
-        # Если это уже итерируемый объект (например, список), используем его напрямую
-        parsed_data = data
-    else:
-        # Если это что-то другое (например, None или не-итерируемый тип), возвращаем пустой список
-        return []
-
-    # Преобразуем все элементы [[price, quantity], ...] в float
-    # Добавляем проверку, чтобы избежать ошибок на пустых или некорректных данных
-    if parsed_data is None:
-        return []
-
+        try: parsed_data = orjson.loads(data)
+        except orjson.JSONDecodeError: return []
+    elif hasattr(data, '__iter__'): parsed_data = data
+    else: return []
+    if parsed_data is None: return []
     converted_data = []
     for item in parsed_data:
         if isinstance(item, list) and len(item) == 2:
-            try:
-                converted_data.append([float(item[0]), float(item[1])])
-            except (ValueError, TypeError):
-                # Пропускаем элементы, которые не могут быть преобразованы в float
-                continue
+            try: converted_data.append([float(item[0]), float(item[1])])
+            except (ValueError, TypeError): continue
     return converted_data
 
-
 def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Применяет функцию очистки и преобразования к колонкам 'bids' и 'asks'.
-    """
-    print("Processing order book data types (parsing strings, converting to float)...")
     for col in ['bids', 'asks']:
         if col in df.columns:
-            # Применяем нашу функцию к каждой ячейке в колонке
             df[col] = df[col].apply(_parse_and_convert_to_float)
     return df
 
+def set_memory_limit(gb_limit: int):
+    if resource is None:
+        print("Модуль 'resource' недоступен. Ограничение по памяти не поддерживается в текущей ОС.")
+        return
+    try:
+        memory_limit_bytes = gb_limit * 1024 * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+        print(f"Установлен лимит памяти: {gb_limit} GB")
+    except (ValueError, resource.error) as e:
+        print(f"Не удалось установить лимит памяти: {e}")
 
 def main():
-    """Основная функция для запуска конвейера подготовки данных."""
-    # --- Установка лимита по памяти (только для Unix) ---
-    if platform.system() == "Linux" or platform.system() == "Darwin":
-        try:
-            memory_limit_gb = 5
-            memory_limit_bytes = memory_limit_gb * 1024 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
-            print(f"Установлен лимит памяти: {memory_limit_gb} GB")
-        except (ValueError, resource.error) as e:
-            print(f"Не удалось установить лимит памяти: {e}")
-    else:
-        print("Ограничение по памяти не поддерживается в текущей ОС.")
-
-    # --- 1. Парсинг аргументов командной строки ---
     parser = argparse.ArgumentParser(
-        description="Подготовка датасета с признаками на основе сырых данных из файлов.",
+        description="Подготовка датасета с признаками на основе сырых данных из файлов (с обработкой по чанкам).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--trades-file', type=str, required=True, help='Путь к Parquet файлу со сделками.')
-    parser.add_argument('--depth-file', type=str, required=True, help='Путь к Parquet файлу со стаканами.')
-    parser.add_argument('--liquidations-file', type=str, required=True, help='Путь к Parquet файлу с ликвидациями.')
-    parser.add_argument('--output', type=str, required=True, help='Путь к выходному Parquet файлу с признаками.')
-
-    # Аргументы для настройки окон признаков
-    parser.add_argument('--delta-window', type=int, default=30, help='Окно для Order Flow Delta.')
-    parser.add_argument('--panic-window', type=int, default=30, help='Окно для Panic Index.')
-    parser.add_argument('--absorption-window', type=int, default=50, help='Окно для Absorption Strength.')
-    parser.add_argument('--obi-levels', type=int, default=5, help='Количество уровней стакана для OBI.')
-    parser.add_argument('--wall-factor', type=float, default=10.0, help='Множитель для определения "стены".')
-    parser.add_argument('--wall-neighborhood', type=int, default=5, help='Кол-во соседних уровней для анализа стены.')
-    parser.add_argument('--imbalance-ratio', type=float, default=3.0, help='Соотношение для определения дисбаланса футпринта.')
-    parser.add_argument('--imbalance-window', type=int, default=100, help='Окно для скользящей суммы дисбаланса футпринта.')
-
+    parser.add_argument('--trades-file', type=str, required=True)
+    parser.add_argument('--depth-file', type=str, required=True)
+    parser.add_argument('--liquidations-file', type=str, required=True)
+    parser.add_argument('--output', type=str, required=True)
+    parser.add_argument('--chunk-size', type=str, default='1D', help='Размер временного чанка (например, "1D", "6H").')
+    parser.add_argument('--memory-limit', type=int, default=10, help='Лимит памяти в ГБ.')
+    parser.add_argument('--delta-window', type=int, default=30)
+    parser.add_argument('--panic-window', type=int, default=30)
+    parser.add_argument('--absorption-window', type=int, default=50)
+    parser.add_argument('--obi-levels', type=int, default=5)
+    parser.add_argument('--wall-factor', type=float, default=10.0)
+    parser.add_argument('--wall-neighborhood', type=int, default=5)
+    parser.add_argument('--imbalance-ratio', type=float, default=3.0)
+    parser.add_argument('--imbalance-window', type=int, default=100)
     args = parser.parse_args()
 
-    print("--- Starting Data Preparation Pipeline from Files ---")
+    set_memory_limit(args.memory_limit)
+    print("--- Starting Data Preparation Pipeline (Stateful Chunked) ---")
 
-    # --- 2. Загрузка всех необходимых данных из файлов ---
+    print(f"Определение полного временного диапазона из {args.trades_file}...")
     try:
-        print(f"Loading trades from {args.trades_file}...")
-        trades_df = pd.read_parquet(args.trades_file)
-        print(f"Loading depth from {args.depth_file}...")
-        depth_df = pd.read_parquet(args.depth_file)
-        print(f"Loading liquidations from {args.liquidations_file}...")
-        liquidations_df = pd.read_parquet(args.liquidations_file)
-    except FileNotFoundError as e:
-        print(f"ERROR: Input file not found: {e}")
-        return
+        trades_index = pd.read_parquet(args.trades_file, columns=[])
+        if trades_index.index.empty:
+            print("Файл со сделками пуст."); return
+        start_date, end_date = trades_index.index.min(), trades_index.index.max()
+        print(f"Данные найдены в диапазоне от {start_date} до {end_date}")
     except Exception as e:
-        print(f"ERROR: Failed to load data from Parquet files: {e}")
-        return
+        print(f"Не удалось прочитать индекс из файла со сделками: {e}"); return
 
-    if trades_df.empty:
-        print("No trade data found. Exiting.")
-        return
+    date_chunks = pd.date_range(start=start_date, end=end_date, freq=args.chunk_size, inclusive='left')
+    if date_chunks.empty: date_chunks = pd.Index([start_date])
+    if date_chunks[-1] < end_date:
+        date_chunks = date_chunks.append(pd.Index([end_date]))
 
-    # --- 2.1. Очистка и преобразование типов данных стакана ---
-    depth_df = _process_orderbook_data(depth_df)
+    processed_chunks = []
+    overlap_df = pd.DataFrame()
 
-    # --- 3. Объединение данных о сделках и стакане ---
-    print("Merging trades and depth data...")
-    merged_df = pd.merge_asof(
-        left=trades_df,
-        right=depth_df,
-        left_index=True,
-        right_index=True,
-        direction='backward'
-    )
+    for i in tqdm(range(len(date_chunks)), desc="Обработка чанков"):
+        chunk_start = date_chunks[i]
+        chunk_end = date_chunks[i+1] if i + 1 < len(date_chunks) else end_date + pd.Timedelta(nanoseconds=1)
+        print(f"\n--- Обработка чанка: {chunk_start} -> {chunk_end} ---")
 
-    # --- 4. РЕСЕМПЛИНГ И РАСЧЕТ ИНДИКАТОРОВ ---
-    print("Resampling tick data to 1-minute OHLCV bars...")
-    agg_rules = {
-        'price': ['first', 'max', 'min', 'last'],
-        'quantity': 'sum'
-    }
-    df_resampled = merged_df.resample('1min').agg(agg_rules)
-    df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
-
-    # Рассчитываем стандартные "человеческие" индикаторы на агрегированных данных
-    standard_indicators_df = calculate_standard_indicators(df_resampled)
-    df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
-
-    # --- 5. ОБЪЕДИНЕНИЕ ПРИЗНАКОВ РАЗНЫХ МАСШТАБОВ ---
-    print("Merging resampled indicators back into the main tick-level dataframe...")
-    indicator_cols_to_merge = standard_indicators_df.columns
-    merged_df = pd.merge_asof(
-        left=merged_df,
-        right=df_resampled[indicator_cols_to_merge],
-        on='event_time',
-        direction='backward'
-    )
-
-    # --- 6. Расчет продвинутых индикаторов ---
-    print("Calculating advanced features sequentially...")
-
-    # Определяем последовательность шагов для расчета признаков.
-    feature_calculation_steps = [
-        ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
-        ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
-        ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
-        ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
-        ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
-    ]
-
-    # Последовательно выполняем каждый шаг расчета
-    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
         try:
-            merged_df[feature_name] = feature_func(merged_df)
-        except Exception as exc:
-            print(f"ERROR: Feature '{feature_name}' generated an exception: {exc}")
+            # Загружаем основные данные для чанка
+            time_filter = [('event_time', '>=', chunk_start), ('event_time', '<', chunk_end)]
+            trades_df_chunk = pd.read_parquet(args.trades_file, filters=time_filter)
 
-    # Отдельно рассчитываем признаки, которые возвращают несколько колонок
-    print("Calculating multi-column features (e.g., Liquidity Walls)...")
-    wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
-    merged_df = pd.concat([merged_df, wall_features_df], axis=1)
-    
-    print("Calculating features from other data streams (e.g., Liquidations)...")
-    cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
-    if not cascade_exhaustion.empty:
-        merged_df = pd.merge_asof(
-            merged_df,
-            cascade_exhaustion.to_frame(name='cascade_exhaustion'),
-            on='event_time',
-            direction='backward'
-        )
-        merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
+            if trades_df_chunk.empty and overlap_df.empty:
+                print("В данном чанке и в буфере перекрытия нет сделок. Пропускаем."); continue
 
-    # --- 7. Очистка и сохранение ---
-    # .dropna() удален, т.к. он слишком агрессивно удаляет строки,
-    # где хотя бы один из множества индикаторов еще не рассчитался.
-    # Обработка NaN - задача этапа моделирования.
-    # merged_df.dropna(inplace=True)
+            # Объединяем с данными из предыдущего чанка для перекрытия
+            trades_df_with_overlap = pd.concat([overlap_df, trades_df_chunk])
+
+            # Загружаем соответствующие данные из других файлов
+            overlap_start_time = trades_df_with_overlap.index.min()
+            full_chunk_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
+            depth_df = pd.read_parquet(args.depth_file, filters=full_chunk_filter)
+
+            liquidations_time_filter = [('time', '>=', overlap_start_time), ('time', '<', chunk_end)]
+            liquidations_df = pd.read_parquet(args.liquidations_file, filters=liquidations_time_filter)
+        except Exception as e:
+            print(f"ERROR: Не удалось загрузить данные для чанка: {e}"); continue
+
+        # --- Обработка ---
+        depth_df = _process_orderbook_data(depth_df)
+        merged_df = pd.merge_asof(trades_df_with_overlap, depth_df, left_index=True, right_index=True, direction='backward')
+
+        agg_rules = {'price': ['first', 'max', 'min', 'last'], 'quantity': 'sum'}
+        df_resampled = merged_df.resample('1min').agg(agg_rules)
+        df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+        df_resampled.dropna(inplace=True)
+
+        if df_resampled.empty:
+            print("В данном чанке после ресемплинга не осталось данных."); continue
+
+        standard_indicators_df = calculate_standard_indicators(df_resampled)
+        df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
+
+        merged_df = pd.merge_asof(merged_df, df_resampled[standard_indicators_df.columns], on='event_time', direction='backward')
+        merged_df.ffill(inplace=True)
+
+        feature_steps = [
+            ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
+            ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
+            ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
+            ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
+            ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
+        ]
+        for name, func in feature_steps:
+            merged_df[name] = func(merged_df)
+
+        merged_df = pd.concat([merged_df, calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)], axis=1)
+
+        cascade = calculate_cascade_exhaustion(liquidations_df)
+        if not cascade.empty:
+            merged_df = pd.merge_asof(merged_df, cascade.to_frame(name='cascade_exhaustion'), on='event_time', direction='backward').fillna({'cascade_exhaustion': 0})
+
+        # --- Обрезка и сохранение ---
+        # Отбрасываем данные, которые были нужны только для перекрытия
+        final_chunk = merged_df.loc[chunk_start:chunk_end]
+        if not final_chunk.empty:
+            processed_chunks.append(final_chunk)
+
+        # Готовим перекрытие для следующего чанка
+        max_lookback = max(args.delta_window, args.panic_window, args.absorption_window, args.imbalance_window)
+        overlap_df = trades_df_with_overlap.tail(max_lookback)
+
+    if not processed_chunks:
+        print("Не было обработано ни одного чанка."); return
+
+    print("Объединение всех обработанных чанков...")
+    final_df = pd.concat(processed_chunks)
 
     output_path = os.path.abspath(args.output)
-    print(f"Saving final dataset to {output_path}...")
+    print(f"Сохранение итогового датасета в {output_path}...")
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        merged_df.to_parquet(output_path, engine='pyarrow')
-        print("Final dataset saved successfully.")
+        final_df.to_parquet(output_path, engine='pyarrow')
+        print("Итоговый датасет успешно сохранен.")
     except Exception as e:
-        print(f"Failed to save final dataset: {e}")
+        print(f"Не удалось сохранить итоговый датасет: {e}")
 
     print("--- Pipeline Finished ---")
 
