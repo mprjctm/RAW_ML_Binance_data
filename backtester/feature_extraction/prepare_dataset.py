@@ -23,7 +23,10 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
+import orjson
 from tqdm import tqdm
+import functools
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Импортируем наши функции для расчета признаков
 from backtester.feature_extraction.features import (
@@ -36,6 +39,53 @@ from backtester.feature_extraction.features import (
     calculate_footprint_imbalance,
     calculate_standard_indicators
 )
+
+
+def _parse_and_convert_to_float(data):
+    """
+    Парсит JSON-строку и преобразует все вложенные числовые строки в float.
+    Также обрабатывает данные, которые уже являются списками, но содержат строки.
+    """
+    if isinstance(data, str):
+        try:
+            # Если данные - это строка, парсим ее как JSON
+            parsed_data = orjson.loads(data)
+        except orjson.JSONDecodeError:
+            return []  # В случае ошибки парсинга возвращаем пустой список
+    elif hasattr(data, '__iter__'):
+        # Если это уже итерируемый объект (например, список), используем его напрямую
+        parsed_data = data
+    else:
+        # Если это что-то другое (например, None или не-итерируемый тип), возвращаем пустой список
+        return []
+
+    # Преобразуем все элементы [[price, quantity], ...] в float
+    # Добавляем проверку, чтобы избежать ошибок на пустых или некорректных данных
+    if parsed_data is None:
+        return []
+
+    converted_data = []
+    for item in parsed_data:
+        if isinstance(item, list) and len(item) == 2:
+            try:
+                converted_data.append([float(item[0]), float(item[1])])
+            except (ValueError, TypeError):
+                # Пропускаем элементы, которые не могут быть преобразованы в float
+                continue
+    return converted_data
+
+
+def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Применяет функцию очистки и преобразования к колонкам 'bids' и 'asks'.
+    """
+    print("Processing order book data types (parsing strings, converting to float)...")
+    for col in ['bids', 'asks']:
+        if col in df.columns:
+            # Применяем нашу функцию к каждой ячейке в колонке
+            df[col] = df[col].apply(_parse_and_convert_to_float)
+    return df
+
 
 def main():
     """Основная функция для запуска конвейера подготовки данных."""
@@ -82,6 +132,9 @@ def main():
         print("No trade data found. Exiting.")
         return
 
+    # --- 2.1. Очистка и преобразование типов данных стакана ---
+    depth_df = _process_orderbook_data(depth_df)
+
     # --- 3. Объединение данных о сделках и стакане ---
     print("Merging trades and depth data...")
     merged_df = pd.merge_asof(
@@ -116,20 +169,41 @@ def main():
     )
 
     # --- 6. Расчет продвинутых индикаторов ---
-    print("Calculating advanced features...")
+    print("Calculating advanced features in parallel (using 4 cores)...")
 
-    # Определяем последовательность шагов для расчета признаков
+    # Определяем последовательность шагов для расчета признаков.
+    # Используем functools.partial для "замораживания" аргументов,
+    # что более надежно для мультипроцессинга, чем lambda.
     feature_calculation_steps = [
-        ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
-        ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
-        ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
-        ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
-        ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
+        ('order_flow_delta', functools.partial(calculate_order_flow_delta, window=args.delta_window)),
+        ('absorption_strength', functools.partial(calculate_absorption_strength, window=args.absorption_window)),
+        ('panic_index', functools.partial(calculate_panic_index, window=args.panic_window)),
+        ('orderbook_imbalance', functools.partial(calculate_orderbook_imbalance, levels=args.obi_levels)),
+        ('footprint_imbalance', functools.partial(calculate_footprint_imbalance, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
     ]
 
-    # Итерируемся по шагам с прогресс-баром
-    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
-        merged_df[feature_name] = feature_func(merged_df)
+    # Используем ProcessPoolExecutor для параллельного выполнения задач
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        # Отправляем задачи на выполнение
+        future_to_feature = {
+            executor.submit(feature_func, merged_df): feature_name
+            for feature_name, feature_func in feature_calculation_steps
+        }
+
+        # Собираем результаты по мере их готовности и отображаем прогресс
+        results = {}
+        for future in tqdm(as_completed(future_to_feature), total=len(feature_calculation_steps), desc="Calculating AI Features"):
+            feature_name = future_to_feature[future]
+            try:
+                feature_series = future.result()
+                results[feature_name] = feature_series
+            except Exception as exc:
+                print(f"ERROR: Feature '{feature_name}' generated an exception: {exc}")
+
+    # Объединяем результаты с основным DataFrame
+    print("Concatenating parallel results...")
+    for feature_name, feature_series in results.items():
+        merged_df[feature_name] = feature_series
 
     # Отдельно рассчитываем признаки, которые возвращают несколько колонок
     print("Calculating multi-column features (e.g., Liquidity Walls)...")
