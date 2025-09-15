@@ -75,17 +75,24 @@ def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_
 
         processed_batches = []
 
-        # Итерация по батчам данных с фильтрацией на уровне Parquet
-        # Загружаем только необходимые колонки
-        for batch in pf.iter_batches(batch_size=batch_size, filters=time_filter, columns=['bids', 'asks', 'event_time']):
+        # iter_batches не принимает 'filters', поэтому фильтруем вручную после загрузки батча.
+        # Загружаем только необходимые колонки.
+        for batch in pf.iter_batches(batch_size=batch_size, columns=['bids', 'asks', 'event_time']):
             batch_df = batch.to_pandas()
-
-            # Убедимся, что event_time является индексом
-            if 'event_time' in batch_df.columns:
-                batch_df = batch_df.set_index('event_time')
 
             if batch_df.empty:
                 continue
+
+            # Ручная фильтрация по времени, так как iter_batches не поддерживает это напрямую.
+            chunk_start = time_filter[0][2]
+            chunk_end = time_filter[1][2]
+            batch_df = batch_df[(batch_df['event_time'] >= chunk_start) & (batch_df['event_time'] < chunk_end)]
+
+            if batch_df.empty:
+                continue
+
+            # Убедимся, что event_time является индексом
+            batch_df = batch_df.set_index('event_time')
 
             # Обработка данных стакана (парсинг JSON)
             processed_df = _process_orderbook_data(batch_df)
@@ -185,7 +192,7 @@ def main():
 
             depth_df = _load_and_process_depth_in_batches(args.depth_file, full_chunk_filter)
 
-            liquidations_time_filter = [('time', '>=', overlap_start_time), ('time', '<', chunk_end)]
+            liquidations_time_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
             liquidations_df = pd.read_parquet(args.liquidations_file, filters=liquidations_time_filter, columns=['quantity'])
 
 
