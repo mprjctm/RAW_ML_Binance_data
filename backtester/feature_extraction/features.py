@@ -260,9 +260,71 @@ def calculate_orderbook_imbalance(df: pd.DataFrame, levels: int = 5) -> pd.Serie
     return imbalance_series.rename("orderbook_imbalance")
 
 
-def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neighborhood: int = 5) -> pd.DataFrame:
+def _find_first_wall_vectorized(prices_df: pd.DataFrame,
+                                vols_df: pd.DataFrame,
+                                wall_factor: float,
+                                neighborhood: int):
+    """
+    Helper-функция для векторизованного поиска стен ликвидности.
+
+    Args:
+        prices_df (pd.DataFrame): DataFrame с ценами уровней (строки - таймстемпы, колонки - уровни).
+        vols_df (pd.DataFrame): DataFrame с объемами уровней.
+        wall_factor (float): Множитель для определения "аномальности" заявки.
+        neighborhood (int): Количество соседних уровней для расчета среднего объема.
+
+    Returns:
+        tuple[pd.Series, pd.Series]: Серии с ценой и объемом найденной стены для каждой строки.
+    """
+    # 1. Расчет среднего объема соседей с использованием скользящих окон
+    # Суммируем объемы в окне размером `2 * neighborhood + 1` с центром в текущем элементе
+    rolling_sum = vols_df.rolling(window=2 * neighborhood + 1, center=True, min_periods=1, axis=1).sum()
+    # Определяем количество непропущенных значений в том же окне
+    rolling_count = vols_df.notna().rolling(window=2 * neighborhood + 1, center=True, min_periods=1, axis=1).sum()
+
+    # Вычитаем собственный объем и количество, чтобы получить сумму и количество только соседей
+    neighbor_sum = rolling_sum - vols_df.fillna(0)
+    neighbor_count = rolling_count - vols_df.notna().astype(int)
+
+    # Рассчитываем среднее, избегая деления на ноль
+    with np.errstate(divide='ignore', invalid='ignore'):
+        avg_neighbor_vol = neighbor_sum / neighbor_count.replace(0, np.nan)
+
+    # 2. Определение стен
+    # Стена - это уровень, где объем значительно превышает средний объем соседей
+    is_wall = (vols_df > (avg_neighbor_vol * wall_factor)) & (avg_neighbor_vol > 0)
+
+    # 3. Поиск первой стены для каждой строки
+    # idxmax() найдет индекс первого True (т.к. True=1, False=0).
+    # Для строк без стен (все False), idxmax вернет индекс первой колонки.
+    wall_indices = is_wall.idxmax(axis=1)
+
+    # Создаем маску, чтобы отфильтровать строки, где стен не найдено
+    has_wall_mask = is_wall.any(axis=1)
+    # Применяем маску: где стен нет, индекс будет NaN
+    wall_indices = wall_indices.where(has_wall_mask, np.nan)
+
+    # 4. Извлечение цены и объема стены
+    # Готовим индексы для продвинутой выборки NumPy
+    row_idx = np.arange(len(prices_df))
+    # Для строк без стен используем 0 как временный индекс, они все равно будут отфильтрованы
+    col_idx = wall_indices.fillna(0).astype(int).values
+
+    # Извлекаем цены и объемы стен с помощью NumPy-индексации
+    wall_prices = pd.Series(prices_df.to_numpy()[row_idx, col_idx], index=prices_df.index)
+    wall_vols = pd.Series(vols_df.to_numpy()[row_idx, col_idx], index=vols_df.index)
+
+    # Применяем маску к результатам
+    wall_prices = wall_prices.where(has_wall_mask, np.nan)
+    wall_vols = wall_vols.where(has_wall_mask, np.nan)
+
+    return wall_prices, wall_vols
+
+
+def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neighborhood: int = 5, max_levels: int = 20) -> pd.DataFrame:
     """
     Анализирует стакан на наличие "стен" ликвидности и рассчитывает их параметры.
+    (Векторизованная версия)
 
     Торговая идея:
     "Стены" — это аномально крупные лимитные заявки, которые могут выступать
@@ -271,164 +333,137 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
     где расположены ключевые уровни интереса крупных игроков.
 
     Особенности реализации:
-    Функция сканирует уровни стакана и ищет заявки, объем которых значительно
-    (в `wall_factor` раз) превышает средний объем на `neighborhood` соседних
-    уровнях. Для найденных стен рассчитываются несколько признаков.
-    Функция возвращает DataFrame с несколькими новыми колонками.
+    Эта версия полностью векторизована с использованием Pandas и NumPy для
+    максимальной производительности на больших датасетах. Она избегает
+    медленных операций `.apply()` по строкам.
+    1. Данные стакана ('bids', 'asks') разворачиваются в широкие DataFrames,
+       где каждая колонка представляет один уровень стакана.
+    2. Расчет среднего объема соседей выполняется с помощью скользящих окон.
+    3. Поиск стен и извлечение их параметров производятся с помощью
+       векторизованных логических операций и NumPy-индексации.
 
     Args:
         df (pd.DataFrame): DataFrame, содержащий колонки 'price', 'bids', 'asks'.
         wall_factor (float): Множитель для определения "аномальности" заявки.
         neighborhood (int): Количество соседних уровней для расчета среднего объема.
+        max_levels (int): Максимальная глубина стакана для анализа. Урезание до
+                          разумного значения (например, 20) сильно повышает
+                          производительность.
 
     Returns:
         pd.DataFrame: DataFrame с новыми признаками, связанными со стенами.
     """
-    print("Calculating Liquidity Walls...")
+    print("Calculating Liquidity Walls (Vectorized)...")
 
-    def find_walls(row):
-        # Инициализируем переменные со значениями по умолчанию (NaN)
-        buy_wall_price, buy_wall_vol, sell_wall_price, sell_wall_vol = np.nan, np.nan, np.nan, np.nan
+    # --- 1. Подготовка данных ---
+    # Заполняем пропуски, если в какой-то момент не было данных стакана
+    df_filled = df[['price', 'bids', 'asks']].bfill()
 
-        # --- Поиск стены на покупку (bids) ---
-        if row['bids'] is not None and len(row['bids']) > neighborhood:
-            volumes = [b[1] for b in row['bids']]
-            for i in range(len(volumes)):
-                # Явное и более надежное формирование списка соседних объемов
-                neighbors = []
-                # Соседи "сверху" (ближе к спреду)
-                if i > 0:
-                    neighbors.extend(volumes[max(0, i - neighborhood):i])
-                # Соседи "снизу" (дальше от спреда)
-                if i < len(volumes) - 1:
-                    neighbors.extend(volumes[i + 1:min(len(volumes), i + neighborhood + 1)])
+    # Функция для быстрой распаковки данных стакана в широкие DataFrame'ы
+    def unpack_book_to_wide_dfs(book_series: pd.Series):
+        # Преобразуем серию списков в список списков
+        book_list = book_series.tolist()
+        # Урезаем и дополняем до max_levels.
+        # [[price, vol], [price, vol], ...] ->
+        # [[p1, v1], [p2, v2], ..., [nan, nan]]
+        padded_list = [
+            (sublist[:max_levels] + [[np.nan, np.nan]] * max_levels)[:max_levels]
+            if sublist else [[np.nan, np.nan]] * max_levels for sublist in book_list
+        ]
+        # Создаем 3D NumPy массив для эффективности
+        arr = np.array(padded_list, dtype=np.float64)
+        # Разделяем на цены и объемы
+        prices = pd.DataFrame(arr[:, :, 0], index=book_series.index)
+        volumes = pd.DataFrame(arr[:, :, 1], index=book_series.index)
+        return prices, volumes
 
-                if not neighbors: continue
+    # Распаковываем биды и аски
+    bid_prices, bid_vols = unpack_book_to_wide_dfs(df_filled['bids'])
+    ask_prices, ask_vols = unpack_book_to_wide_dfs(df_filled['asks'])
 
-                avg_vol = np.mean(neighbors)
+    # --- 2. Поиск стен ---
+    # Находим стены на покупку (bids) и продажу (asks)
+    buy_wall_price, buy_wall_vol = _find_first_wall_vectorized(bid_prices, bid_vols, wall_factor, neighborhood)
+    sell_wall_price, sell_wall_vol = _find_first_wall_vectorized(ask_prices, ask_vols, wall_factor, neighborhood)
 
-                # Если объем на уровне аномально большой - это стена
-                if avg_vol > 0 and volumes[i] / avg_vol >= wall_factor:
-                    buy_wall_price = row['bids'][i][0]
-                    buy_wall_vol = volumes[i]
-                    break  # Нашли ближайшую стену, выходим
+    # --- 3. Расчет финальных признаков ---
+    # Рассчитываем расстояние до стен в процентах от текущей цены
+    current_price = df_filled['price']
+    dist_to_buy_wall = (current_price - buy_wall_price) / current_price * 100
+    dist_to_sell_wall = (sell_wall_price - current_price) / current_price * 100
 
-        # --- Поиск стены на продажу (asks) ---
-        if row['asks'] is not None and len(row['asks']) > neighborhood:
-            volumes = [a[1] for a in row['asks']]
-            for i in range(len(volumes)):
-                neighbors = []
-                if i > 0:
-                    neighbors.extend(volumes[max(0, i - neighborhood):i])
-                if i < len(volumes) - 1:
-                    neighbors.extend(volumes[i + 1:min(len(volumes), i + neighborhood + 1)])
-
-                if not neighbors: continue
-
-                avg_vol = np.mean(neighbors)
-
-                if avg_vol > 0 and volumes[i] / avg_vol >= wall_factor:
-                    sell_wall_price = row['asks'][i][0]
-                    sell_wall_vol = volumes[i]
-                    break
-
-        # Рассчитываем расстояние до стен в процентах от текущей цены
-        current_price = row['price']
-        dist_to_buy_wall = ((current_price - buy_wall_price) / current_price * 100) if not np.isnan(buy_wall_price) else np.nan
-        dist_to_sell_wall = ((sell_wall_price - current_price) / current_price * 100) if not np.isnan(sell_wall_price) else np.nan
-
-        return pd.Series([dist_to_buy_wall, buy_wall_vol, dist_to_sell_wall, sell_wall_vol])
-
-    # Применяем функцию ко всему DataFrame
-    # .bfill() заполняет пропуски, если в какой-то момент не было данных стакана
-    wall_features = df.bfill().apply(find_walls, axis=1)
-    wall_features.columns = ['dist_to_buy_wall', 'buy_wall_vol', 'dist_to_sell_wall', 'sell_wall_vol']
+    # --- 4. Формирование итогового DataFrame ---
+    wall_features = pd.DataFrame({
+        'dist_to_buy_wall': dist_to_buy_wall,
+        'buy_wall_vol': buy_wall_vol,
+        'dist_to_sell_wall': dist_to_sell_wall,
+        'sell_wall_vol': sell_wall_vol
+    })
 
     return wall_features
 
 
 def calculate_footprint_imbalance(df: pd.DataFrame, imbalance_ratio: float = 3.0, window: int = 100) -> pd.Series:
     """
-    Рассчитывает дисбаланс футпринта (Footprint Imbalance).
+    Рассчитывает чистый дисбаланс футпринта (Net Footprint Imbalance).
+    (Векторизованная версия)
 
     Торговая идея:
-    Это самый продвинутый индикатор в нашем наборе. Он анализирует "микроструктуру"
-    каждого бара (или временного окна), показывая, где именно и какой стороной
-    (покупатели или продавцы) был проторгован объем. Сигнал "дисбаланса"
-    возникает, когда агрессивные покупатели на одном уровне цены значительно
-    превосходят по объему агрессивных продавцов на уровне цены ниже. Это
-    указывает на очень сильное, направленное давление, которое, скорее всего,
-    продолжит двигать цену.
+    Этот индикатор анализирует "микроструктуру" каждой сделки, сравнивая
+    агрессивные покупки и продажи на соседних ценовых уровнях.
+    - **Бычий дисбаланс**: Объем покупок на цене N значительно превышает
+      объем продаж на цене N-1. Это говорит о силе покупателей.
+    - **Медвежий дисбаланс**: Объем продаж на цене N значительно превышает
+      объем покупок на цене N+1. Это говорит о силе продавцов.
 
     Особенности реализации:
-    1. Определение агрессора: Для каждой сделки определяется, была ли она
-       инициирована покупателем (цена >= best_ask) или продавцом (цена <= best_bid).
-    2. Построение футпринта: Внутри скользящего окна данные о сделках
-       агрегируются по ценовым уровням, создавая мини-футпринт для этого окна.
-    3. Поиск дисбаланса: Алгоритм сравнивает объем покупок на уровне N с
-       объемом продаж на уровне N-1. Если соотношение превышает `imbalance_ratio`,
-       регистрируется дисбаланс.
-    4. Итоговый признак: Функция возвращает скользящую сумму "чистых"
-       дисбалансов (+1 за бычий, -1 за медвежий), что является мощным
-       признаком для ML-модели.
+    Функция возвращает скользящую сумму "чистых" дисбалансов
+    (+1 за бычий, -1 за медвежий), что является мощным признаком для ML-модели.
+    Реализация полностью векторизована для максимальной производительности.
 
     Args:
         df (pd.DataFrame): DataFrame, содержащий 'price', 'quantity', 'bids', 'asks'.
         imbalance_ratio (float): Соотношение для определения дисбаланса.
-        window (int): Размер скользящего окна для агрегации футпринта.
+        window (int): Размер скользящего окна для агрегации чистого дисбаланса.
 
     Returns:
         pd.Series: Временной ряд чистого дисбаланса футпринта.
     """
-    print("Calculating Footprint Imbalance...")
+    print("Calculating Footprint Imbalance (Vectorized)...")
 
-    # Шаг 1: Определяем агрессора для каждой сделки
-    def get_aggressor(row):
-        if row['bids'] is None or row['asks'] is None or len(row['bids']) == 0 or len(row['asks']) == 0:
-            return 'neutral'
-        best_bid = row['bids'][0][0]
-        best_ask = row['asks'][0][0]
-        if row['price'] >= best_ask: return 'buy'
-        if row['price'] <= best_bid: return 'sell'
-        return 'neutral'
+    # --- 1. Векторизованное определение агрессора ---
+    df_filled = df[['price', 'quantity', 'bids', 'asks']].bfill()
+    best_bid = pd.to_numeric(df_filled['bids'].str[0].str[0], errors='coerce')
+    best_ask = pd.to_numeric(df_filled['asks'].str[0].str[0], errors='coerce')
+    is_buy = df_filled['price'] >= best_ask
+    is_sell = df_filled['price'] <= best_bid
+    buy_vol = df_filled['quantity'].where(is_buy, 0)
+    sell_vol = df_filled['quantity'].where(is_sell, 0)
 
-    aggressor = df.bfill().apply(get_aggressor, axis=1)
-
-    buy_vol = df['quantity'].where(aggressor == 'buy', 0)
-    sell_vol = df['quantity'].where(aggressor == 'sell', 0)
-
-    # Шаг 2: Создаем DataFrame с объемами для анализа
+    # --- 2. Агрегация объемов по ценовым уровням ---
     footprint_df = pd.DataFrame({
-        'price': df['price'],
+        'price': df_filled['price'],
         'buy_vol': buy_vol,
         'sell_vol': sell_vol
     })
-
-    # Шаг 3: Агрегируем объемы по ценам в скользящем окне
-    # Это очень сложная операция. Для упрощения и эффективности, мы будем
-    # рассчитывать дисбаланс не в "кластерах", а на уровне каждой сделки,
-    # сравнивая ее с агрегированными данными предыдущих сделок.
-
-    # Группируем объемы по цене
     price_level_vols = footprint_df.groupby('price')[['buy_vol', 'sell_vol']].sum()
 
-    # Создаем смещенные данные для диагонального сравнения
-    price_level_vols['prev_sell_vol'] = price_level_vols['sell_vol'].shift(1)
+    # --- 3. Расчет диагональных дисбалансов ---
+    # Для бычьего дисбаланса: сравниваем buy_vol(P) с sell_vol(P-1)
+    price_level_vols['prev_sell_vol'] = price_level_vols['sell_vol'].shift(1).fillna(0)
+    price_to_prev_sell_map = price_level_vols['prev_sell_vol']
+    prev_sell_vol_series = footprint_df['price'].map(price_to_prev_sell_map).fillna(0)
+    buy_imbalance = (footprint_df['buy_vol'] > prev_sell_vol_series * imbalance_ratio).astype(int)
 
-    # Сливаем агрегированные данные обратно в основной DataFrame
-    merged_footprint = pd.merge(footprint_df, price_level_vols, on='price', how='left')
+    # Для медвежьего дисбаланса: сравниваем sell_vol(P) с buy_vol(P+1)
+    price_level_vols['next_buy_vol'] = price_level_vols['buy_vol'].shift(-1).fillna(0)
+    price_to_next_buy_map = price_level_vols['next_buy_vol']
+    next_buy_vol_series = footprint_df['price'].map(price_to_next_buy_map).fillna(0)
+    sell_imbalance = (footprint_df['sell_vol'] > next_buy_vol_series * imbalance_ratio).astype(int)
 
-    # Шаг 4: Рассчитываем дисбаланс
-    # Бычий дисбаланс: объем покупок на этом уровне > (объем продаж на уровне ниже * коэф.)
-    # Используем `buy_vol_x`, так как это объем конкретной сделки, а не агрегированный.
-    buy_imbalance = (merged_footprint['buy_vol_x'] > merged_footprint['prev_sell_vol'] * imbalance_ratio).astype(int)
-
-    # Для медвежьего дисбаланса нужно сравнивать sell_vol с buy_vol на уровне выше
-    # Это усложняет векторизованный расчет, поэтому в этой версии мы сфокусируемся
-    # только на бычьем дисбалансе как на более простом для реализации примере.
-    # В полноценной системе здесь был бы более сложный и медленный цикл.
-
-    net_imbalance = buy_imbalance # В этой версии только бычий дисбаланс
+    # --- 4. Расчет чистого дисбаланса и финальный результат ---
+    # Чистый дисбаланс: +1 за бычий, -1 за медвежий
+    net_imbalance = buy_imbalance - sell_imbalance
 
     # Возвращаем скользящую сумму чистого дисбаланса
     return net_imbalance.rolling(window=window).sum().rename('footprint_imbalance')

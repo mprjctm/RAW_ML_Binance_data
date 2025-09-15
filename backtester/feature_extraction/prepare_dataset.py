@@ -24,6 +24,8 @@ import numpy as np
 import argparse
 import os
 import orjson
+import resource
+import sys
 from tqdm import tqdm
 
 # Импортируем наши функции для расчета признаков
@@ -97,6 +99,9 @@ def main():
     parser.add_argument('--liquidations-file', type=str, required=True, help='Путь к Parquet файлу с ликвидациями.')
     parser.add_argument('--output', type=str, required=True, help='Путь к выходному Parquet файлу с признаками.')
 
+    # Системные аргументы
+    parser.add_argument('--memory-limit-gb', type=int, default=5, help='Жесткий лимит на использование ОЗУ в ГБ.')
+
     # Аргументы для настройки окон признаков
     parser.add_argument('--delta-window', type=int, default=30, help='Окно для Order Flow Delta.')
     parser.add_argument('--panic-window', type=int, default=30, help='Окно для Panic Index.')
@@ -109,109 +114,125 @@ def main():
 
     args = parser.parse_args()
 
+    # --- 2. Установка лимита по памяти ---
+    try:
+        # RLIMIT_AS - максимальный размер виртуальной памяти процесса.
+        # Это наиболее надежный способ ограничить общее потребление памяти в Unix.
+        limit_bytes = args.memory_limit_gb * 1024**3
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        print(f"--- Memory limit set to {args.memory_limit_gb} GB ---")
+    except (ImportError, AttributeError, ValueError):
+        # Модуль resource недоступен на Windows.
+        # В этом случае просто выводим предупреждение и продолжаем без лимита.
+        print("--- WARNING: Could not set memory limit (not supported on this OS) ---")
+    except Exception as e:
+        print(f"--- WARNING: An unexpected error occurred while setting memory limit: {e} ---")
+
+
     print("--- Starting Data Preparation Pipeline from Files ---")
 
-    # --- 2. Загрузка всех необходимых данных из файлов ---
     try:
+        # --- 3. Загрузка всех необходимых данных из файлов ---
         print(f"Loading trades from {args.trades_file}...")
         trades_df = pd.read_parquet(args.trades_file)
         print(f"Loading depth from {args.depth_file}...")
         depth_df = pd.read_parquet(args.depth_file)
         print(f"Loading liquidations from {args.liquidations_file}...")
         liquidations_df = pd.read_parquet(args.liquidations_file)
-    except FileNotFoundError as e:
-        print(f"ERROR: Input file not found: {e}")
-        return
-    except Exception as e:
-        print(f"ERROR: Failed to load data from Parquet files: {e}")
-        return
 
-    if trades_df.empty:
-        print("No trade data found. Exiting.")
-        return
+        if trades_df.empty:
+            print("No trade data found. Exiting.")
+            return
 
-    # --- 2.1. Очистка и преобразование типов данных стакана ---
-    depth_df = _process_orderbook_data(depth_df)
+        # --- 3.1. Очистка и преобразование типов данных стакана ---
+        depth_df = _process_orderbook_data(depth_df)
 
-    # --- 3. Объединение данных о сделках и стакане ---
-    print("Merging trades and depth data...")
-    merged_df = pd.merge_asof(
-        left=trades_df,
-        right=depth_df,
-        left_index=True,
-        right_index=True,
-        direction='backward'
-    )
-
-    # --- 4. РЕСЕМПЛИНГ И РАСЧЕТ ИНДИКАТОРОВ ---
-    print("Resampling tick data to 1-minute OHLCV bars...")
-    agg_rules = {
-        'price': ['first', 'max', 'min', 'last'],
-        'quantity': 'sum'
-    }
-    df_resampled = merged_df.resample('1min').agg(agg_rules)
-    df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
-
-    # Рассчитываем стандартные "человеческие" индикаторы на агрегированных данных
-    standard_indicators_df = calculate_standard_indicators(df_resampled)
-    df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
-
-    # --- 5. ОБЪЕДИНЕНИЕ ПРИЗНАКОВ РАЗНЫХ МАСШТАБОВ ---
-    print("Merging resampled indicators back into the main tick-level dataframe...")
-    indicator_cols_to_merge = standard_indicators_df.columns
-    merged_df = pd.merge_asof(
-        left=merged_df,
-        right=df_resampled[indicator_cols_to_merge],
-        on='event_time',
-        direction='backward'
-    )
-
-    # --- 6. Расчет продвинутых индикаторов ---
-    print("Calculating advanced features...")
-
-    # Определяем последовательность шагов для расчета признаков
-    feature_calculation_steps = [
-        ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
-        ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
-        ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
-        ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
-        ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
-    ]
-
-    # Итерируемся по шагам с прогресс-баром
-    for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
-        merged_df[feature_name] = feature_func(merged_df)
-
-    # Отдельно рассчитываем признаки, которые возвращают несколько колонок
-    print("Calculating multi-column features (e.g., Liquidity Walls)...")
-    wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
-    merged_df = pd.concat([merged_df, wall_features_df], axis=1)
-    
-    print("Calculating features from other data streams (e.g., Liquidations)...")
-    cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
-    if not cascade_exhaustion.empty:
+        # --- 4. Объединение данных о сделках и стакане ---
+        print("Merging trades and depth data...")
         merged_df = pd.merge_asof(
-            merged_df,
-            cascade_exhaustion.to_frame(name='cascade_exhaustion'),
+            left=trades_df,
+            right=depth_df,
+            left_index=True,
+            right_index=True,
+            direction='backward'
+        )
+
+        # --- 5. РЕСЕМПЛИНГ И РАСЧЕТ ИНДИКАТОРОВ ---
+        print("Resampling tick data to 1-minute OHLCV bars...")
+        agg_rules = {
+            'price': ['first', 'max', 'min', 'last'],
+            'quantity': 'sum'
+        }
+        df_resampled = merged_df.resample('1min').agg(agg_rules)
+        df_resampled.columns = ['open', 'high', 'low', 'close', 'volume']
+
+        # Рассчитываем стандартные "человеческие" индикаторы на агрегированных данных
+        standard_indicators_df = calculate_standard_indicators(df_resampled)
+        df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
+
+        # --- 6. ОБЪЕДИНЕНИЕ ПРИЗНАКОВ РАЗНЫХ МАСШТАБОВ ---
+        print("Merging resampled indicators back into the main tick-level dataframe...")
+        indicator_cols_to_merge = standard_indicators_df.columns
+        merged_df = pd.merge_asof(
+            left=merged_df,
+            right=df_resampled[indicator_cols_to_merge],
             on='event_time',
             direction='backward'
         )
-        merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
 
-    # --- 7. Очистка и сохранение ---
-    # .dropna() удален, т.к. он слишком агрессивно удаляет строки,
-    # где хотя бы один из множества индикаторов еще не рассчитался.
-    # Обработка NaN - задача этапа моделирования.
-    # merged_df.dropna(inplace=True)
+        # --- 7. Расчет продвинутых индикаторов ---
+        print("Calculating advanced features...")
 
-    output_path = os.path.abspath(args.output)
-    print(f"Saving final dataset to {output_path}...")
-    try:
+        # Определяем последовательность шагов для расчета признаков
+        feature_calculation_steps = [
+            ('order_flow_delta', lambda df: calculate_order_flow_delta(df, window=args.delta_window)),
+            ('absorption_strength', lambda df: calculate_absorption_strength(df, window=args.absorption_window)),
+            ('panic_index', lambda df: calculate_panic_index(df, window=args.panic_window)),
+            ('orderbook_imbalance', lambda df: calculate_orderbook_imbalance(df, levels=args.obi_levels)),
+            ('footprint_imbalance', lambda df: calculate_footprint_imbalance(df, imbalance_ratio=args.imbalance_ratio, window=args.imbalance_window))
+        ]
+
+        # Итерируемся по шагам с прогресс-баром
+        for feature_name, feature_func in tqdm(feature_calculation_steps, desc="Calculating AI Features"):
+            merged_df[feature_name] = feature_func(merged_df)
+
+        # Отдельно рассчитываем признаки, которые возвращают несколько колонок
+        print("Calculating multi-column features (e.g., Liquidity Walls)...")
+        wall_features_df = calculate_liquidity_walls(merged_df, wall_factor=args.wall_factor, neighborhood=args.wall_neighborhood)
+        merged_df = pd.concat([merged_df, wall_features_df], axis=1)
+
+        print("Calculating features from other data streams (e.g., Liquidations)...")
+        cascade_exhaustion = calculate_cascade_exhaustion(liquidations_df)
+        if not cascade_exhaustion.empty:
+            merged_df = pd.merge_asof(
+                merged_df,
+                cascade_exhaustion.to_frame(name='cascade_exhaustion'),
+                on='event_time',
+                direction='backward'
+            )
+            merged_df['cascade_exhaustion'] = merged_df['cascade_exhaustion'].fillna(0)
+
+        # --- 8. Очистка и сохранение ---
+        output_path = os.path.abspath(args.output)
+        print(f"Saving final dataset to {output_path}...")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         merged_df.to_parquet(output_path, engine='pyarrow')
         print("Final dataset saved successfully.")
+
+    except MemoryError:
+        print("\nERROR: Memory limit exceeded!", file=sys.stderr)
+        print(f"The script tried to allocate more memory than the configured limit of {args.memory_limit_gb} GB.", file=sys.stderr)
+        print("Consider increasing the limit using --memory-limit-gb or processing a smaller dataset.", file=sys.stderr)
+        sys.exit(1) # Завершаем скрипт с кодом ошибки
+    except FileNotFoundError as e:
+        print(f"ERROR: Input file not found: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(f"Failed to save final dataset: {e}")
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        # Для отладки можно добавить traceback
+        # import traceback
+        # traceback.print_exc()
+        sys.exit(1)
 
     print("--- Pipeline Finished ---")
 
