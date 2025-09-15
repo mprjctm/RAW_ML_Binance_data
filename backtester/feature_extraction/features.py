@@ -236,9 +236,9 @@ def calculate_orderbook_imbalance(df: pd.DataFrame, levels: int = 5) -> pd.Serie
         bids = row['bids']
         asks = row['asks']
 
-        # Проверяем, что данные не пустые. Прямая проверка `if not bids` может
-        # вызвать ValueError для сложных объектов. Явная проверка надежнее.
-        if bids is None or asks is None or len(bids) == 0 or len(asks) == 0:
+        # Добавляем "защитный" код: проверяем, что данные являются списками и они не пустые.
+        # Это предотвращает TypeError, если на вход попадает NaN или другой некорректный тип.
+        if not isinstance(bids, list) or not isinstance(asks, list) or not bids or not asks:
             return 0.0
 
         # Суммируем объемы на заданном количестве уровней
