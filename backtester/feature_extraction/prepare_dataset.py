@@ -79,7 +79,7 @@ def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_
         # Создаем фильтр, совместимый с pyarrow.dataset
         filter_expression = (ds.field('event_time') >= chunk_start) & (ds.field('event_time') < chunk_end)
 
-        dataset = ds.parquet_dataset(file_path, use_legacy_dataset=False)
+        dataset = ds.parquet_dataset(file_path)
 
         processed_batches = []
 
@@ -106,7 +106,11 @@ def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_
 
     except Exception as e:
         print(f"ERROR: Ошибка при пакетной загрузке данных стакана: {e}")
-        return pd.DataFrame(columns=['bids', 'asks'])
+        # Возвращаем пустой DataFrame с правильной структурой, чтобы избежать MergeError
+        empty_df = pd.DataFrame({'bids': pd.Series(dtype='object'), 'asks': pd.Series(dtype='object')})
+        empty_df.index = pd.to_datetime([]).tz_localize('UTC')
+        empty_df.index.name = 'event_time'
+        return empty_df
 
 
 def set_memory_limit(gb_limit: int):
