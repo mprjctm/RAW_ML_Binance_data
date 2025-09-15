@@ -14,6 +14,7 @@ import argparse
 import os
 import orjson
 import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 from tqdm import tqdm
 import platform
 
@@ -57,51 +58,54 @@ def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
 def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_size: int = 65536) -> pd.DataFrame:
     """
     Загружает и обрабатывает данные стакана по частям (батчам) для экономии памяти.
-    Использует pyarrow для итеративной загрузки, применяет фильтры и обработку
-    к каждому батчу, а затем объединяет результаты.
+    Использует pyarrow.dataset для применения фильтров на уровне чтения файла,
+    что значительно повышает производительность.
 
     Args:
         file_path (str): Путь к Parquet файлу с данными стакана.
-        time_filter (list): Фильтр для pyarrow в формате [('col', 'op', 'val'), ...].
+        time_filter (list): Фильтр в формате [('col', 'op', 'val'), ...].
         batch_size (int): Размер батча для итеративной загрузки.
 
     Returns:
         pd.DataFrame: DataFrame с обработанными данными стакана для всего чанка.
     """
-    print(f"Loading depth data in batches from {file_path}...")
+    print(f"Loading depth data efficiently from {file_path}...")
 
     try:
-        pf = pq.ParquetFile(file_path)
+        # Извлекаем временные рамки из фильтра
+        chunk_start = time_filter[0][2]
+        chunk_end = time_filter[1][2]
+
+        # Создаем фильтр, совместимый с pyarrow.dataset
+        filter_expression = (ds.field('event_time') >= chunk_start) & (ds.field('event_time') < chunk_end)
+
+        dataset = ds.parquet_dataset(file_path, use_legacy_dataset=False)
 
         processed_batches = []
 
-        # Итерация по батчам данных с фильтрацией на уровне Parquet
-        # Загружаем только необходимые колонки
-        for batch in pf.iter_batches(batch_size=batch_size, filters=time_filter, columns=['bids', 'asks', 'event_time']):
+        # to_batches применяет фильтр на уровне чтения, что очень эффективно
+        for batch in dataset.to_batches(
+            filter=filter_expression,
+            batch_size=batch_size,
+            columns=['bids', 'asks', 'event_time']
+        ):
             batch_df = batch.to_pandas()
-
-            # Убедимся, что event_time является индексом
-            if 'event_time' in batch_df.columns:
-                batch_df = batch_df.set_index('event_time')
 
             if batch_df.empty:
                 continue
 
-            # Обработка данных стакана (парсинг JSON)
+            # Устанавливаем индекс и обрабатываем данные
+            batch_df = batch_df.set_index('event_time')
             processed_df = _process_orderbook_data(batch_df)
             processed_batches.append(processed_df)
 
         if not processed_batches:
-            # Возвращаем пустой DataFrame со всеми необходимыми колонками, если ничего не загружено
             return pd.DataFrame(columns=['bids', 'asks'])
 
-        # Объединение всех обработанных батчей
-        full_df = pd.concat(processed_batches)
-        return full_df
+        return pd.concat(processed_batches)
 
     except Exception as e:
         print(f"ERROR: Ошибка при пакетной загрузке данных стакана: {e}")
-        # В случае ошибки возвращаем пустой DataFrame, чтобы не прерывать весь процесс
         return pd.DataFrame(columns=['bids', 'asks'])
 
 
@@ -185,7 +189,7 @@ def main():
 
             depth_df = _load_and_process_depth_in_batches(args.depth_file, full_chunk_filter)
 
-            liquidations_time_filter = [('time', '>=', overlap_start_time), ('time', '<', chunk_end)]
+            liquidations_time_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
             liquidations_df = pd.read_parquet(args.liquidations_file, filters=liquidations_time_filter, columns=['quantity'])
 
 
