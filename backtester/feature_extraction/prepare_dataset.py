@@ -23,6 +23,7 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
+import orjson
 from tqdm import tqdm
 
 # Импортируем наши функции для расчета признаков
@@ -36,6 +37,53 @@ from backtester.feature_extraction.features import (
     calculate_footprint_imbalance,
     calculate_standard_indicators
 )
+
+
+def _parse_and_convert_to_float(data):
+    """
+    Парсит JSON-строку и преобразует все вложенные числовые строки в float.
+    Также обрабатывает данные, которые уже являются списками, но содержат строки.
+    """
+    if isinstance(data, str):
+        try:
+            # Если данные - это строка, парсим ее как JSON
+            parsed_data = orjson.loads(data)
+        except orjson.JSONDecodeError:
+            return []  # В случае ошибки парсинга возвращаем пустой список
+    elif hasattr(data, '__iter__'):
+        # Если это уже итерируемый объект (например, список), используем его напрямую
+        parsed_data = data
+    else:
+        # Если это что-то другое (например, None или не-итерируемый тип), возвращаем пустой список
+        return []
+
+    # Преобразуем все элементы [[price, quantity], ...] в float
+    # Добавляем проверку, чтобы избежать ошибок на пустых или некорректных данных
+    if parsed_data is None:
+        return []
+
+    converted_data = []
+    for item in parsed_data:
+        if isinstance(item, list) and len(item) == 2:
+            try:
+                converted_data.append([float(item[0]), float(item[1])])
+            except (ValueError, TypeError):
+                # Пропускаем элементы, которые не могут быть преобразованы в float
+                continue
+    return converted_data
+
+
+def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Применяет функцию очистки и преобразования к колонкам 'bids' и 'asks'.
+    """
+    print("Processing order book data types (parsing strings, converting to float)...")
+    for col in ['bids', 'asks']:
+        if col in df.columns:
+            # Применяем нашу функцию к каждой ячейке в колонке
+            df[col] = df[col].apply(_parse_and_convert_to_float)
+    return df
+
 
 def main():
     """Основная функция для запуска конвейера подготовки данных."""
@@ -81,6 +129,9 @@ def main():
     if trades_df.empty:
         print("No trade data found. Exiting.")
         return
+
+    # --- 2.1. Очистка и преобразование типов данных стакана ---
+    depth_df = _process_orderbook_data(depth_df)
 
     # --- 3. Объединение данных о сделках и стакане ---
     print("Merging trades and depth data...")
