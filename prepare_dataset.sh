@@ -22,19 +22,7 @@ RAW_TRADES_FILE="$RAW_DATA_DIR/${SYMBOL}_trades.parquet"
 RAW_DEPTH_FILE="$RAW_DATA_DIR/${SYMBOL}_depth.parquet"
 RAW_LIQUIDATIONS_FILE="$RAW_DATA_DIR/${SYMBOL}_liquidations.parquet"
 
-# --- ЭТАП 1: Проверка наличия сырых данных ---
-# Этот скрипт больше не запускает экспорт. Он ожидает, что вы
-# предварительно запустили `export_raw_data.sh`.
-echo "--- Проверка наличия сырых данных ---"
-if [ ! -f "$RAW_TRADES_FILE" ] || [ ! -f "$RAW_DEPTH_FILE" ] || [ ! -f "$RAW_LIQUIDATIONS_FILE" ]; then
-    echo "Ошибка: Один или несколько файлов с сырыми данными не найдены в директории '$RAW_DATA_DIR'."
-    echo "Пожалуйста, сначала запустите 'bash export_raw_data.sh' для их создания."
-    exit 1
-fi
-echo "--- Сырые данные найдены. ---"
-
-
-# --- ЭТАП 2: Расчет признаков из сырых файлов ---
+# --- ЭТАП 1: Расчет признаков из сырых файлов ---
 echo -e "\n--- Запуск ЭТАПА 2: Расчет признаков ---"
 python -m backtester.feature_extraction.prepare_dataset \
     --trades-file "$RAW_TRADES_FILE" \
