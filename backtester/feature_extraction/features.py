@@ -278,9 +278,10 @@ def _find_first_wall_vectorized(prices_df: pd.DataFrame,
     """
     # 1. Расчет среднего объема соседей с использованием скользящих окон
     # Суммируем объемы в окне размером `2 * neighborhood + 1` с центром в текущем элементе
-    rolling_sum = vols_df.rolling(window=2 * neighborhood + 1, center=True, min_periods=1, axis=1).sum()
+    # Используем .T.rolling(...).T для выполнения операции по строкам (axis=1) без FutureWarning
+    rolling_sum = vols_df.T.rolling(window=2 * neighborhood + 1, center=True, min_periods=1).sum().T
     # Определяем количество непропущенных значений в том же окне
-    rolling_count = vols_df.notna().rolling(window=2 * neighborhood + 1, center=True, min_periods=1, axis=1).sum()
+    rolling_count = vols_df.notna().T.rolling(window=2 * neighborhood + 1, center=True, min_periods=1).sum().T
 
     # Вычитаем собственный объем и количество, чтобы получить сумму и количество только соседей
     neighbor_sum = rolling_sum - vols_df.fillna(0)
@@ -354,6 +355,16 @@ def calculate_liquidity_walls(df: pd.DataFrame, wall_factor: float = 10.0, neigh
         pd.DataFrame: DataFrame с новыми признаками, связанными со стенами.
     """
     print("Calculating Liquidity Walls (Vectorized)...")
+
+    # Защита от пустых данных: если на вход пришел пустой DataFrame,
+    # возвращаем пустой DataFrame с правильной структурой.
+    if df.empty:
+        return pd.DataFrame({
+            'dist_to_buy_wall': pd.Series(dtype='float64'),
+            'buy_wall_vol': pd.Series(dtype='float64'),
+            'dist_to_sell_wall': pd.Series(dtype='float64'),
+            'sell_wall_vol': pd.Series(dtype='float64')
+        })
 
     # --- 1. Подготовка данных ---
     # Заполняем пропуски, если в какой-то момент не было данных стакана
