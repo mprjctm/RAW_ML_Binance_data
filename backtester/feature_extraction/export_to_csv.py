@@ -31,10 +31,12 @@ import json
 import time
 import subprocess
 import re
+
 from typing import Callable, Dict, Any
 
 # Импортируем настройки, включая DSN для подключения к БД
 from config import settings
+
 
 def wait_for_low_io(threshold: float = 10.0, sleep_interval: int = 5):
     """
@@ -76,6 +78,7 @@ def wait_for_low_io(threshold: float = 10.0, sleep_interval: int = 5):
         except Exception as e:
             print(f"  - Непредвиденная ошибка при проверке I/O: {e}. Пропускаем проверку.")
             break
+
 
 def parse_args() -> argparse.Namespace:
     """Парсит аргументы командной строки."""
@@ -220,6 +223,7 @@ def main():
             "start": chunk_start,
             "end": chunk_end
         }
+
 
         # Проверяем нагрузку перед каждой операцией записи
         wait_for_low_io()
