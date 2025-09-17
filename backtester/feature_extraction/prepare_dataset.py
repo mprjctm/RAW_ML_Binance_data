@@ -153,6 +153,10 @@ def main():
     except Exception as e:
         print(f"Не удалось прочитать индекс из файла со сделками: {e}"); return
 
+    # Принудительно преобразуем end_date в Timestamp, чтобы избежать TypeError
+    # при сравнении, если end_date была передана как строка.
+    end_date = pd.to_datetime(end_date)
+
     date_chunks = pd.date_range(start=start_date, end=end_date, freq=args.chunk_size, inclusive='left')
     if date_chunks.empty: date_chunks = pd.Index([start_date])
     if date_chunks[-1] < end_date:
