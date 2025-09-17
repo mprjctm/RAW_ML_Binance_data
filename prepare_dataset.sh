@@ -20,6 +20,7 @@ RAW_DEPTH_FILE="$RAW_DATA_DIR/${SYMBOL}_depth.csv"
 RAW_LIQUIDATIONS_FILE="$RAW_DATA_DIR/${SYMBOL}_liquidations.csv"
 
 
+# --- ЭТАП 1: Проверка наличия сырых данных ---
 echo "--- Проверка наличия сырых CSV данных ---"
 if [ ! -f "$RAW_TRADES_FILE" ] || [ ! -f "$RAW_DEPTH_FILE" ] || [ ! -f "$RAW_LIQUIDATIONS_FILE" ]; then
     echo "Ошибка: Один или несколько файлов с сырыми данными (.csv) не найдены в директории '$RAW_DATA_DIR'."

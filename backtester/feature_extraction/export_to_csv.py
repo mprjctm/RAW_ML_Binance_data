@@ -28,10 +28,57 @@ import psycopg2
 from datetime import datetime, timedelta
 from tqdm import tqdm
 import json
+import time
+import subprocess
+import re
+
 from typing import Callable, Dict, Any
 
 # Импортируем настройки, включая DSN для подключения к БД
 from config import settings
+
+
+def wait_for_low_io(threshold: float = 10.0, sleep_interval: int = 5):
+    """
+    Проверяет загрузку I/O wait и приостанавливает выполнение, если она высокая.
+    """
+    while True:
+        try:
+            # Выполняем top в пакетном режиме, 1 итерация
+            result = subprocess.run(['top', '-b', '-n', '1'], capture_output=True, text=True, check=True)
+            top_output = result.stdout
+
+            # Ищем строку с %Cpu(s)
+            cpu_line = ""
+            for line in top_output.splitlines():
+                if "%Cpu(s)" in line:
+                    cpu_line = line
+                    break
+
+            if not cpu_line:
+                print("  - Не удалось найти строку CPU в выводе top. Пропускаем проверку I/O.")
+                return
+
+            # Извлекаем значение 'wa' с помощью регулярного выражения
+            wa_match = re.search(r'(\d+\.\d+)\s+wa', cpu_line)
+            if wa_match:
+                wa_value = float(wa_match.group(1))
+                if wa_value > threshold:
+                    print(f"  - Высокая нагрузка I/O wait: {wa_value} > {threshold}. Пауза на {sleep_interval} сек...")
+                    time.sleep(sleep_interval)
+                else:
+                    # print(f"  - Нагрузка I/O wait в норме: {wa_value} <= {threshold}.")
+                    break
+            else:
+                print("  - Не удалось извлечь значение 'wa' из вывода top. Пропускаем проверку.")
+                break
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"  - Ошибка при выполнении команды top: {e}. Пропускаем проверку I/O.")
+            break
+        except Exception as e:
+            print(f"  - Непредвиденная ошибка при проверке I/O: {e}. Пропускаем проверку.")
+            break
+
 
 def parse_args() -> argparse.Namespace:
     """Парсит аргументы командной строки."""
@@ -176,8 +223,16 @@ def main():
             "start": chunk_start,
             "end": chunk_end
         }
+
+
+        # Проверяем нагрузку перед каждой операцией записи
+        wait_for_low_io()
         export_data_for_chunk(conn, query_trades_template, params, trades_out_path, process_trades)
+
+        wait_for_low_io()
         export_data_for_chunk(conn, query_depth_template, params, depth_out_path, process_depth)
+
+        wait_for_low_io()
         export_data_for_chunk(conn, query_liquidations_template, params, liquidations_out_path, process_liquidations)
 
     conn.close()
