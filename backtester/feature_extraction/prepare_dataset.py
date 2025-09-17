@@ -13,7 +13,6 @@ import numpy as np
 import argparse
 import os
 import orjson
-import pyarrow.parquet as pq
 from tqdm import tqdm
 import platform
 
@@ -54,60 +53,54 @@ def _process_orderbook_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_size: int = 65536) -> pd.DataFrame:
+def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_size: int = 100000) -> pd.DataFrame:
     """
-    Загружает и обрабатывает данные стакана по частям (батчам) для экономии памяти.
-    Использует pyarrow для итеративной загрузки, применяет фильтры и обработку
-    к каждому батчу, а затем объединяет результаты.
+    Загружает и обрабатывает данные стакана из CSV по частям (чанками) для экономии памяти.
+    Использует pd.read_csv с параметром chunksize для итеративной загрузки.
 
     Args:
-        file_path (str): Путь к Parquet файлу с данными стакана.
+        file_path (str): Путь к CSV файлу с данными стакана.
         time_filter (list): Фильтр в формате [('col', 'op', 'val'), ...].
-        batch_size (int): Размер батча для итеративной загрузки.
+        batch_size (int): Количество строк в одном чанке для итеративной загрузки.
 
     Returns:
-        pd.DataFrame: DataFrame с обработанными данными стакана для всего чанка.
+        pd.DataFrame: DataFrame с обработанными данными стакана для всего временного диапазона.
     """
-    print(f"Loading depth data in batches from {file_path}...")
-
+    print(f"Loading depth data in chunks from {file_path}...")
     try:
-        pf = pq.ParquetFile(file_path)
+        chunk_start_time = time_filter[0][2]
+        chunk_end_time = time_filter[1][2]
 
-        processed_batches = []
+        # Создаем итератор для чтения CSV по чанкам
+        csv_reader = pd.read_csv(
+            file_path,
+            chunksize=batch_size,
+            index_col='event_time',
+            parse_dates=True
+        )
 
-        # iter_batches не принимает 'filters', поэтому фильтруем вручную после загрузки батча.
-        # Загружаем только необходимые колонки.
-        for batch in pf.iter_batches(batch_size=batch_size, columns=['bids', 'asks', 'event_time']):
-            batch_df = batch.to_pandas()
-
-            if batch_df.empty:
+        processed_chunks = []
+        for chunk_df in csv_reader:
+            if chunk_df.empty:
                 continue
 
-            # Ручная фильтрация по времени, так как iter_batches не поддерживает это напрямую.
-            chunk_start = time_filter[0][2]
-            chunk_end = time_filter[1][2]
-            batch_df = batch_df[(batch_df['event_time'] >= chunk_start) & (batch_df['event_time'] < chunk_end)]
+            # Фильтруем каждый чанк по времени
+            filtered_chunk = chunk_df[(chunk_df.index >= chunk_start_time) & (chunk_df.index < chunk_end_time)]
 
-            if batch_df.empty:
+            if filtered_chunk.empty:
                 continue
 
-            # Убедимся, что event_time является индексом
-            batch_df = batch_df.set_index('event_time')
+            # Обработка данных стакана (парсинг JSON-подобных строк)
+            processed_df = _process_orderbook_data(filtered_chunk)
+            processed_chunks.append(processed_df)
 
-            # Обработка данных стакана (парсинг JSON)
-            processed_df = _process_orderbook_data(batch_df)
-            processed_batches.append(processed_df)
-
-        if not processed_batches:
-            # Возвращаем пустой DataFrame со всеми необходимыми колонками, если ничего не загружено
+        if not processed_chunks:
             return pd.DataFrame(columns=['bids', 'asks'])
 
-        # Объединение всех обработанных батчей
-        return pd.concat(processed_batches)
+        return pd.concat(processed_chunks)
 
     except Exception as e:
-        print(f"ERROR: Ошибка при пакетной загрузке данных стакана: {e}")
-        # Возвращаем пустой DataFrame с правильной структурой, чтобы избежать MergeError
+        print(f"ERROR: Ошибка при пакетной загрузке данных стакана из CSV: {e}")
         empty_df = pd.DataFrame({'bids': pd.Series(dtype='object'), 'asks': pd.Series(dtype='object')})
         empty_df.index = pd.to_datetime([]).tz_localize('UTC')
         empty_df.index.name = 'event_time'
@@ -151,10 +144,11 @@ def main():
 
     print(f"Определение полного временного диапазона из {args.trades_file}...")
     try:
-        trades_index = pd.read_parquet(args.trades_file, columns=[])
-        if trades_index.index.empty:
+        # Читаем только колонку с временем, чтобы определить диапазон дат
+        trades_index_df = pd.read_csv(args.trades_file, usecols=['event_time'], index_col='event_time', parse_dates=True)
+        if trades_index_df.index.empty:
             print("Файл со сделками пуст."); return
-        start_date, end_date = trades_index.index.min(), trades_index.index.max()
+        start_date, end_date = trades_index_df.index.min(), trades_index_df.index.max()
         print(f"Данные найдены в диапазоне от {start_date} до {end_date}")
     except Exception as e:
         print(f"Не удалось прочитать индекс из файла со сделками: {e}"); return
@@ -173,12 +167,10 @@ def main():
         print(f"\n--- Обработка чанка: {chunk_start} -> {chunk_end} ---")
 
         try:
-            # Загружаем основные данные для чанка
-            time_filter = [('event_time', '>=', chunk_start), ('event_time', '<', chunk_end)]
-
-            trades_df_chunk = pd.read_parquet(args.trades_file, filters=time_filter, columns=['price', 'quantity'])
-
-
+            # Загружаем основные данные для чанка.
+            # Для CSV читаем весь файл и фильтруем по датам в памяти.
+            trades_df = pd.read_csv(args.trades_file, index_col='event_time', parse_dates=True)
+            trades_df_chunk = trades_df.loc[chunk_start:chunk_end]
 
             if trades_df_chunk.empty and overlap_df.empty:
                 print("В данном чанке и в буфере перекрытия нет сделок. Пропускаем."); continue
@@ -188,14 +180,13 @@ def main():
 
             # Загружаем соответствующие данные из других файлов
             overlap_start_time = trades_df_with_overlap.index.min()
+            
+            # Фильтруем данные стакана и ликвидаций по расширенному временному диапазону
             full_chunk_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
-            
-            
-
             depth_df = _load_and_process_depth_in_batches(args.depth_file, full_chunk_filter)
 
-            liquidations_time_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
-            liquidations_df = pd.read_parquet(args.liquidations_file, filters=liquidations_time_filter, columns=['quantity'])
+            liquidations_df_full = pd.read_csv(args.liquidations_file, index_col='event_time', parse_dates=True)
+            liquidations_df = liquidations_df_full.loc[overlap_start_time:chunk_end]
 
 
 
