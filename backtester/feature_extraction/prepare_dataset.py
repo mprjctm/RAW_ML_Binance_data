@@ -75,14 +75,17 @@ def _load_and_process_depth_in_batches(file_path: str, time_filter: list, batch_
         csv_reader = pd.read_csv(
             file_path,
             chunksize=batch_size,
-            index_col='event_time',
-            parse_dates=True
         )
 
         processed_chunks = []
         for chunk_df in csv_reader:
-            if chunk_df.empty:
+            if chunk_df.empty or 'event_time' not in chunk_df.columns:
                 continue
+
+            # Принудительно конвертируем и очищаем данные
+            chunk_df['event_time'] = pd.to_datetime(chunk_df['event_time'], errors='coerce')
+            chunk_df.dropna(subset=['event_time'], inplace=True)
+            chunk_df.set_index('event_time', inplace=True)
 
             # Фильтруем каждый чанк по времени
             filtered_chunk = chunk_df[(chunk_df.index >= chunk_start_time) & (chunk_df.index < chunk_end_time)]
@@ -153,6 +156,10 @@ def main():
     except Exception as e:
         print(f"Не удалось прочитать индекс из файла со сделками: {e}"); return
 
+    # Принудительно преобразуем end_date в Timestamp, чтобы избежать TypeError
+    # при сравнении, если end_date была передана как строка.
+    end_date = pd.to_datetime(end_date)
+
     date_chunks = pd.date_range(start=start_date, end=end_date, freq=args.chunk_size, inclusive='left')
     if date_chunks.empty: date_chunks = pd.Index([start_date])
     if date_chunks[-1] < end_date:
@@ -168,8 +175,12 @@ def main():
 
         try:
             # Загружаем основные данные для чанка.
-            # Для CSV читаем весь файл и фильтруем по датам в памяти.
-            trades_df = pd.read_csv(args.trades_file, index_col='event_time', parse_dates=True)
+            trades_df = pd.read_csv(args.trades_file)
+            if 'event_time' not in trades_df.columns:
+                print(f"ERROR: В файле {args.trades_file} отсутствует колонка 'event_time'."); continue
+            trades_df['event_time'] = pd.to_datetime(trades_df['event_time'], errors='coerce')
+            trades_df.dropna(subset=['event_time'], inplace=True)
+            trades_df.set_index('event_time', inplace=True)
             trades_df_chunk = trades_df.loc[chunk_start:chunk_end]
 
             if trades_df_chunk.empty and overlap_df.empty:
@@ -185,8 +196,15 @@ def main():
             full_chunk_filter = [('event_time', '>=', overlap_start_time), ('event_time', '<', chunk_end)]
             depth_df = _load_and_process_depth_in_batches(args.depth_file, full_chunk_filter)
 
-            liquidations_df_full = pd.read_csv(args.liquidations_file, index_col='event_time', parse_dates=True)
-            liquidations_df = liquidations_df_full.loc[overlap_start_time:chunk_end]
+            liquidations_df_full = pd.read_csv(args.liquidations_file)
+            if 'event_time' not in liquidations_df_full.columns:
+                print(f"WARNING: В файле {args.liquidations_file} отсутствует колонка 'event_time'. Продолжаем без данных о ликвидациях.")
+                liquidations_df = pd.DataFrame() # Создаем пустой DataFrame
+            else:
+                liquidations_df_full['event_time'] = pd.to_datetime(liquidations_df_full['event_time'], errors='coerce')
+                liquidations_df_full.dropna(subset=['event_time'], inplace=True)
+                liquidations_df_full.set_index('event_time', inplace=True)
+                liquidations_df = liquidations_df_full.loc[overlap_start_time:chunk_end]
 
 
 

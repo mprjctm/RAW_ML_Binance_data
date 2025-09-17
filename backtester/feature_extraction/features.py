@@ -443,10 +443,12 @@ def calculate_footprint_imbalance(df: pd.DataFrame, imbalance_ratio: float = 3.0
     # .bfill() для гарантии отсутствия пропусков в данных стакана при расчете
     df_filled = df[['price', 'quantity', 'bids', 'asks']].bfill()
 
-    # Извлекаем цены лучшего бида и аска. .str[0].str[0] - векторизованный
-    # способ получить первый элемент из вложенного списка.
-    best_bid = pd.to_numeric(df_filled['bids'].str[0].str[0], errors='coerce')
-    best_ask = pd.to_numeric(df_filled['asks'].str[0].str[0], errors='coerce')
+    # Безопасно извлекаем цены лучшего бида и аска.
+    # Данные в колонках 'bids'/'asks' - это списки списков [[цена, объем], ...].
+    # Поэтому мы используем .apply() для безопасного доступа к вложенным элементам.
+    safe_get_price = lambda x: x[0][0] if isinstance(x, list) and len(x) > 0 and isinstance(x[0], list) and len(x[0]) > 0 else None
+    best_bid = pd.to_numeric(df_filled['bids'].apply(safe_get_price), errors='coerce')
+    best_ask = pd.to_numeric(df_filled['asks'].apply(safe_get_price), errors='coerce')
 
     # Определяем условия для покупки и продажи
     is_buy = df_filled['price'] >= best_ask
