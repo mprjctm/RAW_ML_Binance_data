@@ -188,6 +188,10 @@ def main():
     # при сравнении, если end_date была передана как строка.
     end_date = pd.to_datetime(end_date)
 
+    # Принудительно преобразуем end_date в Timestamp, чтобы избежать TypeError
+    # при сравнении, если end_date была передана как строка.
+    end_date = pd.to_datetime(end_date)
+
     date_chunks = pd.date_range(start=start_date, end=end_date, freq=args.chunk_size, inclusive='left')
     if date_chunks.empty: date_chunks = pd.Index([start_date])
     if date_chunks[-1] < end_date:
@@ -205,7 +209,11 @@ def main():
             # Загружаем основные данные для чанка.
             trades_df = pd.read_csv(args.trades_file)
             if 'event_time' not in trades_df.columns:
+
                 logging.error(f"ERROR: В файле {args.trades_file} отсутствует колонка 'event_time'."); continue
+
+                print(f"ERROR: В файле {args.trades_file} отсутствует колонка 'event_time'."); continue
+
             trades_df['event_time'] = pd.to_datetime(trades_df['event_time'], errors='coerce')
             trades_df.dropna(subset=['event_time'], inplace=True)
             trades_df.set_index('event_time', inplace=True)
@@ -228,14 +236,19 @@ def main():
 
             liquidations_df_full = pd.read_csv(args.liquidations_file)
             if 'event_time' not in liquidations_df_full.columns:
+
                 logging.warning(f"В файле {args.liquidations_file} отсутствует колонка 'event_time'. Продолжаем без данных о ликвидациях.")
+                print(f"WARNING: В файле {args.liquidations_file} отсутствует колонка 'event_time'. Продолжаем без данных о ликвидациях.")
+
                 liquidations_df = pd.DataFrame() # Создаем пустой DataFrame
             else:
                 liquidations_df_full['event_time'] = pd.to_datetime(liquidations_df_full['event_time'], errors='coerce')
                 liquidations_df_full.dropna(subset=['event_time'], inplace=True)
                 liquidations_df_full.set_index('event_time', inplace=True)
                 liquidations_df = liquidations_df_full.loc[overlap_start_time:chunk_end]
+
             log_df_info(liquidations_df, "liquidations_chunk")
+
 
 
         except Exception as e:
