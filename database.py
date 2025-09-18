@@ -156,6 +156,52 @@ class Database:
         sql = "INSERT INTO depth_snapshots (time, symbol, market_type, payload) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING"
         await self._pool.executemany(sql, records)
 
+    # --- Data Query Methods ---
+
+    async def get_klines(self, symbol: str, interval: str, start_time: datetime, end_time: datetime) -> List[asyncpg.Record]:
+        """
+        Fetches OHLCV (candlestick) data for a given symbol and interval.
+
+        Args:
+            symbol: The trading symbol (e.g., 'BTCUSDT').
+            interval: The time interval (e.g., '1m', '5m', '1h'). Must be a valid PostgreSQL interval string.
+            start_time: The start of the time range.
+            end_time: The end of the time range.
+
+        Returns:
+            A list of records, each containing bucket, open, high, low, close, and volume.
+        """
+        # Note: The `first` and `last` aggregates are part of the TimescaleDB extension
+        # and are crucial for correctly calculating open and close prices.
+        sql = """
+            SELECT
+                time_bucket($1, event_time) AS "time",
+                first(price, event_time) AS "open",
+                max(price) AS "high",
+                min(price) AS "low",
+                last(price, event_time) AS "close",
+                sum(quantity) AS "volume"
+            FROM
+                agg_trades
+            WHERE
+                symbol = $2 AND
+                event_time >= $3 AND event_time < $4
+            GROUP BY
+                "time"
+            ORDER BY
+                "time" ASC;
+        """
+        try:
+            # Important: asyncpg uses prepared statements, which caches the query plan.
+            # Using the interval directly in the string might be problematic if it changes often.
+            # However, for `time_bucket`, the interval is an argument to the function, not a parameter of the query itself in the same way.
+            # Passing it as a parameter ($1) is the correct and safe way to do this.
+            records = await self._pool.fetch(sql, interval, symbol, start_time, end_time)
+            return records
+        except Exception as e:
+            logger.error(f"Error fetching kline data for {symbol}: {e}")
+            return []
+
     # --- Data Preparation Methods ---
 
     def prepare_agg_trade(self, data: dict) -> Tuple:
