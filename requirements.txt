@@ -12,3 +12,7 @@ numpy
 pyarrow
 psycopg2-binary
 tqdm
+lightgbm
+seaborn
+matplotlib
+scikit-learn
