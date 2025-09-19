@@ -189,11 +189,6 @@ def main():
     end_date = pd.to_datetime(end_date)
 
 
-    # Принудительно преобразуем end_date в Timestamp, чтобы избежать TypeError
-    # при сравнении, если end_date была передана как строка.
-    end_date = pd.to_datetime(end_date)
-
-
     date_chunks = pd.date_range(start=start_date, end=end_date, freq=args.chunk_size, inclusive='left')
     if date_chunks.empty: date_chunks = pd.Index([start_date])
     if date_chunks[-1] < end_date:
@@ -211,6 +206,7 @@ def main():
             # Загружаем основные данные для чанка.
             trades_df = pd.read_csv(args.trades_file)
             if 'event_time' not in trades_df.columns:
+
               
 
                 logging.error(f"ERROR: В файле {args.trades_file} отсутствует колонка 'event_time'."); continue
@@ -245,6 +241,7 @@ def main():
                 logging.warning(f"В файле {args.liquidations_file} отсутствует колонка 'event_time'. Продолжаем без данных о ликвидациях.")
                 print(f"WARNING: В файле {args.liquidations_file} отсутствует колонка 'event_time'. Продолжаем без данных о ликвидациях.")
 
+
                 liquidations_df = pd.DataFrame() # Создаем пустой DataFrame
             else:
                 liquidations_df_full['event_time'] = pd.to_datetime(liquidations_df_full['event_time'], errors='coerce')
@@ -276,7 +273,11 @@ def main():
         standard_indicators_df = calculate_standard_indicators(df_resampled)
         df_resampled = pd.concat([df_resampled, standard_indicators_df], axis=1)
 
-        merged_df = pd.merge_asof(merged_df, df_resampled[standard_indicators_df.columns], left_index=True, right_index=True, direction='backward')
+        # Исправлено: объединяем со всем df_resampled, чтобы включить колонки OHLCV
+        merged_df = pd.merge_asof(merged_df, df_resampled, left_index=True, right_index=True, direction='backward')
+
+
+
         merged_df.ffill(inplace=True)
         log_df_info(merged_df, "after_standard_indicators_merge")
 
