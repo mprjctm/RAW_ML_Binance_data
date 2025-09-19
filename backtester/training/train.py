@@ -73,8 +73,22 @@ def main():
     # 3. Подготовка данных
     # Удаляем строки с NaN в таргете (последние `horizon` минут, для которых нет будущего)
     df.dropna(subset=['target'], inplace=True)
+
+
+    # --- Подготовка признаков для модели ---
+    # 1. Выбираем только числовые колонки, так как LightGBM не может работать с другими типами (например, со списками в 'bids')
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+    # 2. Определяем колонки, которые не являются предикторами (признаками)
+    cols_to_exclude = ['open', 'high', 'low', 'close', 'volume', 'target']
+
+    # 3. Создаем финальный список признаков
+    features = [col for col in numeric_cols if col not in cols_to_exclude]
+    print(f"Найдено {len(features)} числовых признаков для обучения.")
+
     # Выбираем признаки для обучения (все, кроме цен и целевой переменной)
     features = [col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
+
 
     # Заполняем пропуски в признаках нулями (простой подход)
     df[features] = df[features].fillna(0)
